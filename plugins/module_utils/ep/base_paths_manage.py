@@ -191,3 +191,31 @@ class BasePath:
         ```
         """
         return cls.nd_manage_fabrics(fabric_name, "policyActions", action)
+
+    @classmethod
+    def nd_manage_config_templates(cls, *segments: str) -> str:
+        """
+        # Summary
+
+        Build ND manage configTemplates API path.
+
+        ## Parameters
+
+        - segments: Path segments to append after configTemplates
+                    (e.g., template_name, "parameters")
+
+        ## Returns
+
+        - Complete ND manage configTemplates path
+
+        ## Example
+
+        ```python
+        path = BasePath.nd_manage_config_templates("switch_freeform")
+        # Returns: /api/v1/manage/configTemplates/switch_freeform
+
+        path = BasePath.nd_manage_config_templates("switch_freeform", "parameters")
+        # Returns: /api/v1/manage/configTemplates/switch_freeform/parameters
+        ```
+        """
+        return cls.nd_manage("configTemplates", *segments)

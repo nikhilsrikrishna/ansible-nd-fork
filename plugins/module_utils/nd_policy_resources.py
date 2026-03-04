@@ -31,9 +31,13 @@ __metaclass__ = type
 __author__ = "L Nikhil Sri Krishna"
 
 import logging
+import re
 from typing import Any, Dict, List, Optional, Tuple
 
 from ansible_collections.cisco.nd.plugins.module_utils.enums import OperationType
+from ansible_collections.cisco.nd.plugins.module_utils.ep.ep_api_v1_manage_config_templates import (
+    EpApiV1ManageConfigTemplatesGet,
+)
 from ansible_collections.cisco.nd.plugins.module_utils.ep.ep_api_v1_manage_policies import (
     EpApiV1ManagePoliciesGet,
     EpApiV1ManagePoliciesPost,
@@ -105,6 +109,12 @@ class NDPolicyModule:
         self.cluster_name = self.module.params.get("cluster_name")
         self.check_mode = self.module.check_mode
 
+        # Template parameter cache: {templateName: [param_dict, ...]}
+        # Populated lazily by _fetch_template_params() to avoid
+        # redundant API calls when multiple config entries share the
+        # same template.
+        self._template_params_cache: Dict[str, List[Dict]] = {}
+
         self.log.info(
             f"Initialized NDPolicyModule for fabric: {self.fabric_name}, state: {self.state}"
         )
@@ -162,6 +172,30 @@ class NDPolicyModule:
         diff_results = []
         for config_entry in self.config:
             want = self._build_want(config_entry, state="merged")
+
+            # Phase 1a: Validate templateInputs against template schema
+            template_name = want.get("templateName")
+            template_inputs = want.get("templateInputs") or {}
+            if template_name and not self._is_policy_id(template_name):
+                validation_errors = self._validate_template_inputs(
+                    template_name, template_inputs
+                )
+                if validation_errors:
+                    error_msg = (
+                        f"Template input validation failed for '{template_name}': "
+                        + "; ".join(validation_errors)
+                    )
+                    self.log.error(error_msg)
+                    diff_results.append({
+                        "action": "fail",
+                        "want": want,
+                        "have": None,
+                        "diff": None,
+                        "policy_id": None,
+                        "error_msg": error_msg,
+                    })
+                    continue
+
             have_list, error_msg = self._build_have(want)
 
             if error_msg:
@@ -472,6 +506,231 @@ class NDPolicyModule:
 
         self.log.debug(f"Built want: {want}")
         return want
+
+    # =========================================================================
+    # Template Input Validation
+    # =========================================================================
+
+    def _fetch_template_params(self, template_name: str) -> List[Dict]:
+        """Fetch and cache parameter definitions for a config template.
+
+        Calls ``GET /api/v1/manage/configTemplates/{templateName}`` and
+        extracts the ``parameters`` array. Results are cached per
+        ``template_name`` so multiple config entries sharing the same
+        template incur only one API call.
+
+        Args:
+            template_name: The NDFC template name (e.g., ``switch_freeform``).
+
+        Returns:
+            List of parameter dicts, each with at minimum ``name``,
+            ``parameterType``, ``optional``, and ``defaultValue`` keys.
+            Returns an empty list if the template has no parameters or
+            the API call fails.
+        """
+        self.log.debug(f"ENTER: _fetch_template_params(template_name={template_name})")
+
+        if template_name in self._template_params_cache:
+            self.log.debug(
+                f"Template params cache hit for '{template_name}': "
+                f"{len(self._template_params_cache[template_name])} params"
+            )
+            return self._template_params_cache[template_name]
+
+        ep = EpApiV1ManageConfigTemplatesGet()
+        ep.template_name = template_name
+
+        try:
+            data = self.nd.request(ep.path, ep.verb)
+        except Exception as exc:
+            self.log.warning(
+                f"Failed to fetch template '{template_name}' parameters: {exc}. "
+                "Skipping template input validation."
+            )
+            self._template_params_cache[template_name] = []
+            return []
+
+        # The response is a templateData object with 'parameters' key.
+        # 'parameters' is a list of templateParameter objects.
+        params = data.get("parameters") if isinstance(data, dict) else []
+        if params is None:
+            params = []
+
+        self._template_params_cache[template_name] = params
+        self.log.info(
+            f"Fetched {len(params)} parameter definitions for template '{template_name}'"
+        )
+        self.log.debug(
+            f"Template '{template_name}' param names: "
+            f"{[p.get('name') for p in params]}"
+        )
+        self.log.debug(f"EXIT: _fetch_template_params()")
+        return params
+
+    def _validate_template_inputs(
+        self, template_name: str, template_inputs: Dict[str, Any]
+    ) -> List[str]:
+        """Validate user-provided templateInputs against the template schema.
+
+        Performs three checks:
+            1. **Unknown keys** — every key in ``template_inputs`` must
+               correspond to a parameter ``name`` in the template definition.
+            2. **Missing required parameters** — every parameter where
+               ``optional`` is ``False`` AND ``defaultValue`` is empty/null
+               must be supplied by the user.
+            3. **Basic type validation** — lightweight format checks for
+               common ``parameterType`` values (boolean, Integer, ipV4Address,
+               etc.). Values that fail these checks are reported as warnings,
+               not hard failures, because the controller's own validation is
+               authoritative.
+
+        Args:
+            template_name: Template name for fetching parameter definitions.
+            template_inputs: User-provided ``templateInputs`` dict.
+
+        Returns:
+            List of validation error message strings. Empty list means all
+            inputs are valid.
+        """
+        self.log.debug(
+            f"ENTER: _validate_template_inputs(template={template_name}, "
+            f"input_keys={list(template_inputs.keys())})"
+        )
+
+        params = self._fetch_template_params(template_name)
+        if not params:
+            self.log.debug("No template params available, skipping validation")
+            return []
+
+        errors: List[str] = []
+
+        # Build lookup: param_name -> param_def
+        param_map: Dict[str, Dict] = {}
+        for p in params:
+            name = p.get("name")
+            if name:
+                param_map[name] = p
+
+        # ------------------------------------------------------------------
+        # Check 1: Unknown keys
+        # ------------------------------------------------------------------
+        valid_names = set(param_map.keys())
+        for user_key in template_inputs:
+            if user_key not in valid_names:
+                errors.append(
+                    f"Unknown templateInput key '{user_key}' for template "
+                    f"'{template_name}'. Valid keys: {sorted(valid_names)}"
+                )
+
+        # ------------------------------------------------------------------
+        # Check 2: Missing required parameters
+        # ------------------------------------------------------------------
+        for pname, pdef in param_map.items():
+            is_optional = pdef.get("optional", True)
+            default_val = pdef.get("defaultValue")
+            has_default = default_val is not None and str(default_val).strip() != ""
+
+            if not is_optional and not has_default and pname not in template_inputs:
+                errors.append(
+                    f"Required templateInput '{pname}' (type={pdef.get('parameterType', '?')}) "
+                    f"is missing for template '{template_name}'"
+                )
+
+        # ------------------------------------------------------------------
+        # Check 3: Basic type validation (soft checks)
+        # ------------------------------------------------------------------
+        for user_key, user_val in template_inputs.items():
+            pdef = param_map.get(user_key)
+            if not pdef:
+                continue  # Already flagged as unknown above
+
+            ptype = (pdef.get("parameterType") or "").lower()
+            val_str = str(user_val)
+
+            if ptype == "boolean":
+                if val_str.lower() not in ("true", "false"):
+                    errors.append(
+                        f"templateInput '{user_key}' for template '{template_name}' "
+                        f"expects boolean (true/false), got '{val_str}'"
+                    )
+
+            elif ptype == "integer":
+                try:
+                    int(val_str)
+                except ValueError:
+                    errors.append(
+                        f"templateInput '{user_key}' for template '{template_name}' "
+                        f"expects integer, got '{val_str}'"
+                    )
+
+            elif ptype == "long":
+                try:
+                    int(val_str)
+                except ValueError:
+                    errors.append(
+                        f"templateInput '{user_key}' for template '{template_name}' "
+                        f"expects long integer, got '{val_str}'"
+                    )
+
+            elif ptype == "float":
+                try:
+                    float(val_str)
+                except ValueError:
+                    errors.append(
+                        f"templateInput '{user_key}' for template '{template_name}' "
+                        f"expects float, got '{val_str}'"
+                    )
+
+            elif ptype in ("ipv4address", "ipaddress"):
+                # Basic IPv4 check
+                ipv4_pattern = r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$"
+                if not re.match(ipv4_pattern, val_str):
+                    errors.append(
+                        f"templateInput '{user_key}' for template '{template_name}' "
+                        f"expects IPv4 address (e.g., 192.168.1.1), got '{val_str}'"
+                    )
+
+            elif ptype == "ipv4addresswithsubnet":
+                ipv4_subnet_pattern = r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}/\d{1,2}$"
+                if not re.match(ipv4_subnet_pattern, val_str):
+                    errors.append(
+                        f"templateInput '{user_key}' for template '{template_name}' "
+                        f"expects IPv4 address with subnet (e.g., 192.168.1.1/24), got '{val_str}'"
+                    )
+
+            elif ptype == "macaddress":
+                mac_pattern = r"^([0-9a-fA-F]{4}\.){2}[0-9a-fA-F]{4}$|^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$"
+                if not re.match(mac_pattern, val_str):
+                    errors.append(
+                        f"templateInput '{user_key}' for template '{template_name}' "
+                        f"expects MAC address, got '{val_str}'"
+                    )
+
+            elif ptype == "enum":
+                # If metaProperties contains 'validValues', check against them
+                meta = pdef.get("metaProperties") or {}
+                valid_values_str = meta.get("validValues")
+                if valid_values_str:
+                    # validValues format is typically "val1,val2,val3"
+                    valid_values = [v.strip() for v in valid_values_str.split(",")]
+                    if val_str not in valid_values:
+                        errors.append(
+                            f"templateInput '{user_key}' for template '{template_name}' "
+                            f"expects one of {valid_values}, got '{val_str}'"
+                        )
+
+        if errors:
+            self.log.warning(
+                f"Template input validation found {len(errors)} errors "
+                f"for template '{template_name}': {errors}"
+            )
+        else:
+            self.log.debug(
+                f"Template input validation passed for template '{template_name}'"
+            )
+
+        self.log.debug("EXIT: _validate_template_inputs()")
+        return errors
 
     def _build_have(self, want: Dict) -> Tuple[List[Dict], Optional[str]]:
         """Query the controller to find existing policies matching the want.
