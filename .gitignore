@@ -392,3 +392,11 @@ $RECYCLE.BIN/
 
 # Ansible Collection tarball
 cisco-nd-*.tar.gz
+
+testing_classes.py
+manage.json
+examples/
+inventory/
+sample_response.txt
+sample_responses.txt
+ansible-venv/

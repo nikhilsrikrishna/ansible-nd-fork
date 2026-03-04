@@ -277,6 +277,12 @@ class NDModule:
             self._rest_send = RestSend(params)
             self._rest_send.sender = self._sender
             self._rest_send.response_handler = self._response_handler
+            # Override retry behavior: for simple CRUD operations we want
+            # a single attempt, not the default 300s retry loop.
+            # Setting send_interval == timeout ensures the while-loop in
+            # _commit_normal_mode executes exactly once.
+            self._rest_send.timeout = 10
+            self._rest_send.send_interval = 10
 
             msg = f"{self.class_name}.{method_name}: "
             msg += "Initialized RestSend instance with params: "

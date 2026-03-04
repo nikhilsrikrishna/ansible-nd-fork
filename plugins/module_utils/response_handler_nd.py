@@ -106,7 +106,8 @@ class ResponseHandler:
 
     # HTTP status codes considered successful
     # 200: OK, 201: Created, 202: Accepted, 204: No Content
-    RETURN_CODES_SUCCESS: set[int] = {200, 201, 202, 204}
+    # 207: Multi-Status (used by NDFC bulk operations like POST /policies)
+    RETURN_CODES_SUCCESS: set[int] = {200, 201, 202, 204, 207}
     # 404 is handled separately as "not found but not an error"
     RETURN_CODE_NOT_FOUND: int = 404
 

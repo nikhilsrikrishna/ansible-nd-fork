@@ -108,3 +108,86 @@ class BasePath:
         ```
         """
         return cls.nd_manage("inventory", *segments)
+
+    @classmethod
+    def nd_manage_fabrics(cls, *segments: str) -> str:
+        """
+        # Summary
+
+        Build ND manage fabrics API path.
+
+        ## Parameters
+
+        - segments: Path segments to append after fabrics
+
+        ## Returns
+
+        - Complete ND manage fabrics path
+
+        ## Example
+
+        ```python
+        path = BasePath.nd_manage_fabrics("my-fabric")
+        # Returns: /api/v1/manage/fabrics/my-fabric
+
+        path = BasePath.nd_manage_fabrics("my-fabric", "policies")
+        # Returns: /api/v1/manage/fabrics/my-fabric/policies
+        ```
+        """
+        return cls.nd_manage("fabrics", *segments)
+
+    @classmethod
+    def nd_manage_fabric_policies(cls, fabric_name: str, *segments: str) -> str:
+        """
+        # Summary
+
+        Build ND manage fabric policies API path.
+
+        ## Parameters
+
+        - fabric_name: Name of the fabric (required)
+        - segments: Additional path segments (e.g., policy_id)
+
+        ## Returns
+
+        - Complete ND manage fabric policies path
+
+        ## Example
+
+        ```python
+        path = BasePath.nd_manage_fabric_policies("my-fabric")
+        # Returns: /api/v1/manage/fabrics/my-fabric/policies
+
+        path = BasePath.nd_manage_fabric_policies("my-fabric", "POLICY-123")
+        # Returns: /api/v1/manage/fabrics/my-fabric/policies/POLICY-123
+        ```
+        """
+        return cls.nd_manage_fabrics(fabric_name, "policies", *segments)
+
+    @classmethod
+    def nd_manage_fabric_policy_actions(cls, fabric_name: str, action: str) -> str:
+        """
+        # Summary
+
+        Build ND manage fabric policyActions API path.
+
+        ## Parameters
+
+        - fabric_name: Name of the fabric (required)
+        - action: The action to perform (markDelete, pushConfig, remove)
+
+        ## Returns
+
+        - Complete ND manage fabric policyActions path
+
+        ## Example
+
+        ```python
+        path = BasePath.nd_manage_fabric_policy_actions("my-fabric", "markDelete")
+        # Returns: /api/v1/manage/fabrics/my-fabric/policyActions/markDelete
+
+        path = BasePath.nd_manage_fabric_policy_actions("my-fabric", "pushConfig")
+        # Returns: /api/v1/manage/fabrics/my-fabric/policyActions/pushConfig
+        ```
+        """
+        return cls.nd_manage_fabrics(fabric_name, "policyActions", action)
