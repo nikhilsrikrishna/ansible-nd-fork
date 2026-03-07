@@ -605,21 +605,37 @@ class NDPolicyModule:
         errors: List[str] = []
 
         # Build lookup: param_name -> param_def
+        # Filter out internal parameters (annotations.IsInternal == "true")
+        # that the controller auto-populates (e.g., SERIAL_NUMBER, POLICY_ID,
+        # SOURCE, FABRIC_NAME). Users should never need to set these.
         param_map: Dict[str, Dict] = {}
+        internal_names: set = set()
         for p in params:
             name = p.get("name")
-            if name:
+            if not name:
+                continue
+            annotations = p.get("annotations") or {}
+            if str(annotations.get("IsInternal", "")).lower() == "true":
+                internal_names.add(name)
+            else:
                 param_map[name] = p
 
+        self.log.debug(
+            f"Template '{template_name}': {len(param_map)} user params, "
+            f"{len(internal_names)} internal params ({sorted(internal_names)})"
+        )
+
         # ------------------------------------------------------------------
-        # Check 1: Unknown keys
+        # Check 1: Unknown keys (skip internal params — they are allowed
+        # but not advertised to users)
         # ------------------------------------------------------------------
-        valid_names = set(param_map.keys())
+        valid_names = set(param_map.keys()) | internal_names
+        user_facing_names = set(param_map.keys())
         for user_key in template_inputs:
             if user_key not in valid_names:
                 errors.append(
                     f"Unknown templateInput key '{user_key}' for template "
-                    f"'{template_name}'. Valid keys: {sorted(valid_names)}"
+                    f"'{template_name}'. Valid keys: {sorted(user_facing_names)}"
                 )
 
         # ------------------------------------------------------------------
@@ -792,11 +808,11 @@ class NDPolicyModule:
             return policies, None
 
         # Case C: use_desc_as_key=true, search by switchId + description
+        want_desc = want.get("description", "") or ""
         self.log.debug(
             f"Case C: Lookup by switchId={want['switchId']} + "
             f"description='{want_desc}'"
         )
-        want_desc = want.get("description", "") or ""
         if not want_desc:
             self.log.warning("Case C: description is required but not provided")
             return [], "description is required when use_desc_as_key=true and name is a template name"
@@ -1023,7 +1039,7 @@ class NDPolicyModule:
             if action == "fail":
                 self._register_result(
                     action="policy_merged",
-                    operation_type=OperationType.UPDATE,
+                    operation_type=OperationType.QUERY,
                     return_code=-1,
                     message=error_msg,
                     success=False,
@@ -1438,7 +1454,7 @@ class NDPolicyModule:
                 self._register_result(
                     action="policy_deleted",
                     state="deleted",
-                    operation_type=OperationType.DELETE,
+                    operation_type=OperationType.QUERY,
                     return_code=-1,
                     message=error_msg,
                     success=False,
