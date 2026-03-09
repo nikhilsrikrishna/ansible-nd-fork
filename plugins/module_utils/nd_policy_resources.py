@@ -16,10 +16,10 @@ The module file ``nd_policy.py`` contains only DOCUMENTATION, argument_spec,
 and a thin ``main()`` that instantiates this class and calls ``manage_state()``.
 
 Models (from ``models.policy``):
-    - ``PolicyCreate``      – single policy create payload
-    - ``PolicyCreateBulk``  – bulk policy create wrapper
-    - ``PolicyUpdate``      – policy update payload (extends PolicyCreate)
-    - ``PolicyIds``         – list of policy IDs for actions
+    - ``PolicyCreate``      - single policy create payload
+    - ``PolicyCreateBulk``  - bulk policy create wrapper
+    - ``PolicyUpdate``      - policy update payload (extends PolicyCreate)
+    - ``PolicyIds``         - list of policy IDs for actions
 """
 
 from __future__ import absolute_import, annotations, division, print_function
@@ -36,7 +36,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from ansible_collections.cisco.nd.plugins.module_utils.enums import OperationType
 from ansible_collections.cisco.nd.plugins.module_utils.ep.ep_api_v1_manage_config_templates import (
-    EpApiV1ManageConfigTemplatesGet,
+    EpApiV1ManageConfigTemplateParametersGet,
 )
 from ansible_collections.cisco.nd.plugins.module_utils.ep.ep_api_v1_manage_policies import (
     EpApiV1ManagePoliciesGet,
@@ -70,10 +70,10 @@ class NDPolicyModule:
         - 3-step delete flow: markDelete → pushConfig → remove
 
     Schema models (from ``models.policy``):
-        - ``PolicyCreate``      – single policy create request body
-        - ``PolicyCreateBulk``  – bulk create wrapper
-        - ``PolicyUpdate``      – update request body (extends PolicyCreate)
-        - ``PolicyIds``         – list of policy IDs for bulk actions
+        - ``PolicyCreate``      - single policy create request body
+        - ``PolicyCreateBulk``  - bulk create wrapper
+        - ``PolicyUpdate``      - update request body (extends PolicyCreate)
+        - ``PolicyIds``         - list of policy IDs for bulk actions
     """
 
     # =========================================================================
@@ -103,7 +103,6 @@ class NDPolicyModule:
         self.config = self.module.params.get("config")
         self.state = self.module.params.get("state")
         self.use_desc_as_key = self.module.params.get("use_desc_as_key")
-        self.create_additional_policy = self.module.params.get("create_additional_policy")
         self.deploy = self.module.params.get("deploy")
         self.ticket_id = self.module.params.get("ticket_id")
         self.cluster_name = self.module.params.get("cluster_name")
@@ -136,18 +135,26 @@ class NDPolicyModule:
         self.module.exit_json(**final)
 
     # =========================================================================
-    # Public API – State Management
+    # Public API - State Management
     # =========================================================================
 
     def manage_state(self) -> None:
         """Main entry point for state management.
 
         Reads ``self.state`` and delegates to the appropriate handler:
-            - **merged**  – create / update / skip policies
-            - **query**   – read-only lookup
-            - **deleted** – markDelete → pushConfig → remove
+            - **merged**  - create / update / skip policies
+            - **query**   - read-only lookup
+            - **deleted** - markDelete → pushConfig → remove
+
+        Before dispatching to the state handler, ``_validate_config()`` is
+        called to perform upfront validation.  When ``use_desc_as_key=true``
+        the entire task is treated as an atomic unit — any validation
+        failure aborts the run before any changes are made.
         """
         self.log.info(f"Managing state: {self.state}")
+
+        # Upfront validation — hard-fail before any API mutations
+        self._validate_config()
 
         if self.state == "merged":
             self._handle_merged_state()
@@ -157,6 +164,79 @@ class NDPolicyModule:
             self._handle_deleted_state()
         else:
             self.module.fail_json(msg=f"Unsupported state: {self.state}")
+
+    # =========================================================================
+    # Upfront Validation
+    # =========================================================================
+
+    def _validate_config(self) -> None:
+        """Validate the playbook config before any API calls are made.
+
+        When ``use_desc_as_key=true``:
+            1. Every config entry for ``merged`` / ``deleted`` states **must**
+               have a non-empty ``description`` (unless ``name`` is a policy ID
+               or ``name`` is omitted for switch-only operations).
+            2. The ``description + switch`` combination must be unique across
+               all config entries within the playbook.  Duplicate pairs would
+               lead to ambiguous matching at the controller and are rejected.
+
+        These checks ensure the entire task fails atomically before
+        making any changes, rather than partially executing.
+        """
+        if not self.use_desc_as_key:
+            return
+
+        self.log.debug("ENTER: _validate_config() [use_desc_as_key=true]")
+
+        desc_switch_counts: Dict[str, int] = {}
+
+        for idx, entry in enumerate(self.config):
+            name = entry.get("name", "")
+            switch = entry.get("switch", "")
+            description = entry.get("description", "")
+
+            # Skip validation for policy-ID lookups (direct by ID) and
+            # switch-only entries (no name → "all policies on switch").
+            if name and self._is_policy_id(name):
+                continue
+            if not name:
+                # Switch-only: valid for query/deleted (no description needed)
+                continue
+
+            # Check 1: description must not be empty when use_desc_as_key=true
+            # and a template name is given (merged or deleted state).
+            if self.state in ("merged", "deleted") and not description:
+                self.module.fail_json(
+                    msg=(
+                        f"config[{idx}]: description cannot be empty when "
+                        f"use_desc_as_key=true and name is a template name "
+                        f"('{name}'). Provide a unique description for each "
+                        f"policy or set use_desc_as_key=false."
+                    )
+                )
+
+            # Check 2: description + switch must be unique within the playbook.
+            if description:
+                key = f"{description}|{switch}"
+                desc_switch_counts[key] = desc_switch_counts.get(key, 0) + 1
+
+        # Report all duplicates at once
+        duplicates = [
+            f"description='{k.split('|')[0]}', switch='{k.split('|')[1]}'"
+            for k, count in desc_switch_counts.items()
+            if count > 1
+        ]
+        if duplicates:
+            self.module.fail_json(
+                msg=(
+                    "Duplicate description+switch combinations found in the "
+                    "playbook config (use_desc_as_key=true requires each "
+                    "description to be unique per switch): "
+                    + "; ".join(duplicates)
+                )
+            )
+
+        self.log.debug("EXIT: _validate_config() — all checks passed")
 
     # =========================================================================
     # State Handlers
@@ -411,11 +491,11 @@ class NDPolicyModule:
             policies = data.get("policies", [])
             self.log.debug(f"Raw query returned {len(policies)} policies")
             # Filter out:
-            # 1. Policies marked for deletion (markDeleted=True) — they have negated
-            #    priority and are pending removal. Should not match for idempotency.
-            # 2. Shadow/pending sub-policies (source != "") — when a policy is modified
-            #    but not yet deployed, NDFC creates a shadow copy with the original
-            #    policyId in the 'source' field. Including these causes false matches.
+            # 1. Policies marked for deletion (markDeleted=True) — pending removal,
+            #    should not match for idempotency checks.
+            # 2. Shadow/pending sub-policies (source != "") — when a policy is
+            #    modified but not yet deployed, NDFC creates a shadow copy.
+            #    Including these causes false duplicate matches.
             filtered = [
                 p for p in policies
                 if not p.get("markDeleted", False)
@@ -432,11 +512,15 @@ class NDPolicyModule:
     def _query_policy_by_id(self, policy_id: str) -> Optional[Dict]:
         """Query a single policy by its ID.
 
+        Policies that are marked for deletion (``markDeleted=True``) are
+        treated as non-existent because they are pending removal and
+        cannot be updated.
+
         Args:
             policy_id: Policy ID (e.g., "POLICY-121110").
 
         Returns:
-            Policy dict, or None if not found.
+            Policy dict, or None if not found or marked for deletion.
         """
         self.log.debug(f"Looking up policy by ID: {policy_id}")
 
@@ -449,6 +533,11 @@ class NDPolicyModule:
         try:
             data = self.nd.request(ep.path, ep.verb)
             if isinstance(data, dict) and data:
+                if data.get("markDeleted", False):
+                    self.log.info(
+                        f"Policy {policy_id} is marked for deletion, treating as not found"
+                    )
+                    return None
                 self.log.debug(f"Policy {policy_id} found")
                 return data
             self.log.info(f"Policy {policy_id} not found (empty response)")
@@ -490,6 +579,9 @@ class NDPolicyModule:
             want["policyId"] = name
         elif name:
             want["templateName"] = name
+
+        # Per-entry create_additional_policy flag (carried on want dict)
+        want["create_additional_policy"] = config_entry.get("create_additional_policy", True)
 
         # For merged state, include all payload fields
         if state == "merged":
@@ -537,7 +629,7 @@ class NDPolicyModule:
             )
             return self._template_params_cache[template_name]
 
-        ep = EpApiV1ManageConfigTemplatesGet()
+        ep = EpApiV1ManageConfigTemplateParametersGet()
         ep.template_name = template_name
 
         try:
@@ -874,7 +966,17 @@ class NDPolicyModule:
 
         # =================================================================
         # CASES 1-6: Template name given, use_desc_as_key=false
+        #
+        # Template names are not unique — multiple policies can share the
+        # same template.  Therefore, existing policies are never updated
+        # in-place when identified by template name alone.  A new policy
+        # is always created.  To update a specific policy, the user must
+        # provide its policy ID.
+        # create_additional_policy controls whether an identical (no-diff)
+        # policy is duplicated.
         # =================================================================
+        create_additional = want.get("create_additional_policy", True)
+
         if not self.use_desc_as_key and "templateName" in want:
             if match_count == 0:
                 # Case 1: No match → CREATE
@@ -888,23 +990,22 @@ class NDPolicyModule:
                 result["policy_id"] = have.get("policyId")
 
                 if not diff:
-                    # Case 2: Match, no diff → SKIP
+                    if create_additional:
+                        # Case 2a: Exact match, create_additional=true → CREATE duplicate
+                        result["action"] = "create"
+                        return result
+                    # Case 2b: Exact match, create_additional=false → SKIP
                     result["action"] = "skip"
                     return result
 
-                if self.create_additional_policy:
-                    # Case 3: Match, has diff, create_additional=true → CREATE duplicate
-                    result["action"] = "create"
-                    result["diff"] = diff
-                    return result
-
-                # Case 4: Match, has diff, create_additional=false → UPDATE
-                result["action"] = "update"
+                # Case 3/4: Diff exists — template name cannot uniquely
+                # identify a policy, so always CREATE a new one.
+                result["action"] = "create"
                 result["diff"] = diff
                 return result
 
             # match_count >= 2
-            if self.create_additional_policy:
+            if create_additional:
                 # Case 5: Multiple matches, create_additional=true → CREATE another
                 result["action"] = "create"
                 return result
@@ -936,17 +1037,18 @@ class NDPolicyModule:
                 want["templateName"] = have["templateName"]
 
             if not diff:
-                # Case 8: Match, no diff → SKIP
+                if create_additional:
+                    # Case 8a: Exact match, create_additional=true → CREATE duplicate
+                    # Strip policyId so create doesn't fail with "not unique"
+                    want.pop("policyId", None)
+                    result["action"] = "create"
+                    return result
+                # Case 8b: Match, no diff → SKIP
                 result["action"] = "skip"
                 return result
 
-            if self.create_additional_policy:
-                # Case 9: Match, has diff, create_additional=true → CREATE duplicate
-                result["action"] = "create"
-                result["diff"] = diff
-                return result
-
-            # Case 10/11: Match, has diff, create_additional=false → UPDATE
+            # Case 10/11: Match, has diff → UPDATE (policy ID uniquely
+            # identifies the policy, so in-place update is safe)
             result["action"] = "update"
             result["diff"] = diff
             return result
@@ -990,15 +1092,17 @@ class NDPolicyModule:
                 }
                 return result
 
-            # Case 16: Multiple matches → FAIL (ambiguous)
-            result["action"] = "fail"
-            result["error_msg"] = (
-                f"Multiple policies ({match_count}) found with description "
-                f"'{want.get('description')}' on switch {want.get('switchId')}. "
-                "Cannot determine which policy to update. "
-                "Use a policy ID directly or ensure descriptions are unique."
+            # Case 16: Multiple matches → hard FAIL (ambiguous)
+            # Abort the entire task atomically — no partial changes.
+            self.module.fail_json(
+                msg=(
+                    f"Multiple policies ({match_count}) found with description "
+                    f"'{want.get('description')}' on switch {want.get('switchId')}. "
+                    "Cannot determine which policy to update when "
+                    "use_desc_as_key=true. Remove the duplicate policies from "
+                    "NDFC or use a policy ID directly."
+                )
             )
-            return result
 
         # Should not reach here
         result["action"] = "fail"
@@ -1242,12 +1346,15 @@ class NDPolicyModule:
                 result["action"] = "found"
                 return result
 
-            # Q-13: Multiple matches → return all with warning
+            # Q-13: Multiple matches — return all with a warning.
+            # Query is read-only so there's no risk of ambiguous mutation.
+            # The warning alerts the user that descriptions aren't unique.
             result["action"] = "found"
             result["warning"] = (
                 f"Multiple policies ({match_count}) found with description "
-                f"'{want_desc}' and template '{want.get('templateName')}' on "
-                f"switch {want.get('switchId')}. Descriptions are not unique."
+                f"'{want_desc}' on switch {want.get('switchId')}. "
+                "Descriptions should be unique per switch when "
+                "use_desc_as_key=true."
             )
             return result
 
@@ -1402,14 +1509,18 @@ class NDPolicyModule:
                 result["action"] = "delete"
                 return result
 
-            # D-12: Multiple matches → delete all with warning
-            result["action"] = "delete_all"
-            result["warning"] = (
-                f"Multiple policies ({match_count}) found with description "
-                f"'{want_desc}' and template '{want.get('templateName')}' on "
-                f"switch {want.get('switchId')}. All will be deleted."
+            # D-12: Multiple matches → hard FAIL (ambiguous)
+            # Abort the entire task atomically — do not silently delete
+            # multiple policies when descriptions should be unique.
+            self.module.fail_json(
+                msg=(
+                    f"Multiple policies ({match_count}) found with description "
+                    f"'{want_desc}' on switch {want.get('switchId')}. "
+                    "Descriptions must be unique per switch when "
+                    "use_desc_as_key=true. Remove the duplicate policies from "
+                    "NDFC or use a policy ID directly."
+                )
             )
-            return result
 
         # Should not reach here
         result["action"] = "skip"
@@ -1701,11 +1812,9 @@ class NDPolicyModule:
         """Update an existing policy via PUT.
 
         For templateInputs, merge user-specified keys on top of the
-        controller's existing values. This matches the old dcnm_policy
-        behaviour: start from the controller's nvPairs, then overlay
-        only the keys the user provided. This prevents accidentally
-        wiping inputs when the user only wants to change description
-        or priority.
+        controller's existing values.  This prevents accidentally
+        wiping template inputs when the user only wants to change
+        description or priority.
 
         Args:
             want: The want dict with desired policy fields.

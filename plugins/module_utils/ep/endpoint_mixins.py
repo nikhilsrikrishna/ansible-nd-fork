@@ -92,4 +92,3 @@ class PolicyIdMixin(BaseModel):
     """Mixin for endpoints that require policy_id parameter."""
 
     policy_id: Optional[str] = Field(default=None, min_length=1, description="Policy ID (e.g., POLICY-234000)")
-

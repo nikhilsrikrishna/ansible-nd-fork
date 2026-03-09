@@ -14,7 +14,6 @@ Endpoints covered:
 - POST /fabrics/{fabricName}/policies - Create policies in bulk
 - GET /fabrics/{fabricName}/policies/{policyId} - Get policy by ID
 - PUT /fabrics/{fabricName}/policies/{policyId} - Update a policy
-- DELETE /fabrics/{fabricName}/policies/{policyId} - Delete a policy
 - POST /fabrics/{fabricName}/policyActions/markDelete - Mark-delete policies
 - POST /fabrics/{fabricName}/policyActions/pushConfig - Push config to policies
 - POST /fabrics/{fabricName}/policyActions/remove - Remove policies in bulk
@@ -181,7 +180,7 @@ class PolicyPushConfigEndpointParams(EndpointQueryParams):
 # ============================================================================
 
 
-class EpApiV1ManagePoliciesGet(FabricNameMixin, BaseModel):
+class EpApiV1ManagePoliciesGet(FabricNameMixin, PolicyIdMixin, BaseModel):
     """
     # Summary
 
@@ -236,11 +235,6 @@ class EpApiV1ManagePoliciesGet(FabricNameMixin, BaseModel):
     class_name: Literal["EpApiV1ManagePoliciesGet"] = Field(
         default="EpApiV1ManagePoliciesGet",
         description="Class name for backward compatibility",
-    )
-    policy_id: Optional[str] = Field(
-        default=None,
-        min_length=1,
-        description="Policy ID (e.g., POLICY-234000)",
     )
     endpoint_params: PoliciesEndpointParams = Field(
         default_factory=PoliciesEndpointParams,
@@ -368,7 +362,7 @@ class EpApiV1ManagePoliciesPost(FabricNameMixin, BaseModel):
 # ============================================================================
 
 
-class EpApiV1ManagePoliciesPut(FabricNameMixin, BaseModel):
+class EpApiV1ManagePoliciesPut(FabricNameMixin, PolicyIdMixin, BaseModel):
     """
     # Summary
 
@@ -422,11 +416,6 @@ class EpApiV1ManagePoliciesPut(FabricNameMixin, BaseModel):
         default="EpApiV1ManagePoliciesPut",
         description="Class name for backward compatibility",
     )
-    policy_id: Optional[str] = Field(
-        default=None,
-        min_length=1,
-        description="Policy ID (required for update)",
-    )
     endpoint_params: PolicyMutationEndpointParams = Field(
         default_factory=PolicyMutationEndpointParams,
         description="Query parameters: clusterName, ticketId",
@@ -449,85 +438,6 @@ class EpApiV1ManagePoliciesPut(FabricNameMixin, BaseModel):
     def verb(self) -> HttpVerbEnum:
         """Return the HTTP verb for this endpoint."""
         return HttpVerbEnum.PUT
-
-
-# ============================================================================
-# DELETE /fabrics/{fabricName}/policies/{policyId}
-# ============================================================================
-
-
-class EpApiV1ManagePoliciesDelete(FabricNameMixin, BaseModel):
-    """
-    # Summary
-
-    ND Manage Policies DELETE Endpoint
-
-    ## Description
-
-    Delete a specific policy from a fabric by policy ID.
-
-    ## Path
-
-    - /api/v1/manage/fabrics/{fabricName}/policies/{policyId}
-
-    ## Verb
-
-    - DELETE
-
-    ## Query Parameters (per manage.json)
-
-    - clusterName (optional): Target cluster in multi-cluster deployment
-    - ticketId (optional): Change Control Ticket Id
-
-    ## Usage
-
-    ```python
-    request = EpApiV1ManagePoliciesDelete()
-    request.fabric_name = "my-fabric"
-    request.policy_id = "POLICY-12345"
-
-    path = request.path
-    verb = request.verb
-
-    # With change control ticket
-    request.endpoint_params.ticket_id = "MyTicket1234"
-    path = request.path
-    ```
-    """
-
-    model_config = COMMON_CONFIG
-
-    class_name: Literal["EpApiV1ManagePoliciesDelete"] = Field(
-        default="EpApiV1ManagePoliciesDelete",
-        description="Class name for backward compatibility",
-    )
-    policy_id: Optional[str] = Field(
-        default=None,
-        min_length=1,
-        description="Policy ID (required for delete)",
-    )
-    endpoint_params: PolicyMutationEndpointParams = Field(
-        default_factory=PolicyMutationEndpointParams,
-        description="Query parameters: clusterName, ticketId",
-    )
-
-    @property
-    def path(self) -> str:
-        """Build the endpoint path with optional query string."""
-        if self.fabric_name is None:
-            raise ValueError("fabric_name must be set before accessing path")
-        if self.policy_id is None:
-            raise ValueError("policy_id must be set before accessing path")
-        base_path = BasePath.nd_manage_fabric_policies(self.fabric_name, self.policy_id)
-        query_string = self.endpoint_params.to_query_string()
-        if query_string:
-            return f"{base_path}?{query_string}"
-        return base_path
-
-    @property
-    def verb(self) -> HttpVerbEnum:
-        """Return the HTTP verb for this endpoint."""
-        return HttpVerbEnum.DELETE
 
 
 # ============================================================================

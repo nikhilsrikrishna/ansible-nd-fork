@@ -10,7 +10,6 @@ This module contains endpoint definitions for configuration template
 operations in the ND Manage API.
 
 Endpoints covered:
-- GET /configTemplates/{templateName} - Get template (with parameters and content)
 - GET /configTemplates/{templateName}/parameters - Get template parameters only
 """
 
@@ -35,62 +34,6 @@ from ansible_collections.cisco.nd.plugins.module_utils.pydantic_compat import (
 
 # Common Pydantic config
 COMMON_CONFIG = ConfigDict(validate_assignment=True)
-
-
-class EpApiV1ManageConfigTemplatesGet(BaseModel):
-    """
-    # Summary
-
-    ND Manage Config Templates GET Endpoint
-
-    ## Description
-
-    Retrieve a configuration template by name, including its parameters
-    and content. The ``parameters`` array in the response describes each
-    template variable with name, parameterType, optional flag,
-    defaultValue, metaProperties, and annotations.
-
-    ## Path
-
-    - /api/v1/manage/configTemplates/{templateName}
-
-    ## Verb
-
-    - GET
-
-    ## Usage
-
-    ```python
-    request = EpApiV1ManageConfigTemplatesGet()
-    request.template_name = "switch_freeform"
-    path = request.path     # /api/v1/manage/configTemplates/switch_freeform
-    verb = request.verb     # GET
-    ```
-    """
-
-    model_config = COMMON_CONFIG
-
-    class_name: Literal["EpApiV1ManageConfigTemplatesGet"] = Field(
-        default="EpApiV1ManageConfigTemplatesGet",
-        description="Class name for backward compatibility",
-    )
-    template_name: Optional[str] = Field(
-        default=None,
-        min_length=1,
-        description="Configuration template name (e.g., switch_freeform, feature_enable)",
-    )
-
-    @property
-    def path(self) -> str:
-        """Build the endpoint path."""
-        if self.template_name is None:
-            raise ValueError("template_name must be set before accessing path")
-        return BasePath.nd_manage_config_templates(self.template_name)
-
-    @property
-    def verb(self) -> HttpVerbEnum:
-        """Return the HTTP verb for this endpoint."""
-        return HttpVerbEnum.GET
 
 
 class EpApiV1ManageConfigTemplateParametersGet(BaseModel):
