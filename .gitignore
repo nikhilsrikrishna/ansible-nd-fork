@@ -392,3 +392,8 @@ $RECYCLE.BIN/
 
 # Ansible Collection tarball
 cisco-nd-*.tar.gz
+
+# Local dev files
+ansible-venv/
+examples/
+inventory/
