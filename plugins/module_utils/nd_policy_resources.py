@@ -10,7 +10,9 @@ Provides all business logic for switch policy management on NDFC 4.x:
     - Policy CRUD (create, read, update, delete)
     - Idempotency diff calculation for merged, query, deleted states
     - Deploy (pushConfig) orchestration
-    - Bulk markDelete → pushConfig → remove delete flow
+    - Conditional delete flow:
+      deploy=true  → markDelete → pushConfig → remove
+      deploy=false → markDelete only
 
 The module file ``nd_policy.py`` contains only DOCUMENTATION, argument_spec,
 and a thin ``main()`` that instantiates this class and calls ``manage_state()``.
@@ -35,18 +37,19 @@ import re
 from typing import Any, Dict, List, Optional, Tuple
 
 from ansible_collections.cisco.nd.plugins.module_utils.enums import OperationType
-from ansible_collections.cisco.nd.plugins.module_utils.endpoints.v1.nd_manage_config_templates.config_templates import (
+from ansible_collections.cisco.nd.plugins.module_utils.endpoints.v1.nd_manage_policies.config_templates import (
     EpManageConfigTemplateParametersGet,
 )
 from ansible_collections.cisco.nd.plugins.module_utils.endpoints.v1.nd_manage_policies.policies import (
+    EpManagePoliciesDelete,
     EpManagePoliciesGet,
     EpManagePoliciesPost,
     EpManagePoliciesPut,
 )
 from ansible_collections.cisco.nd.plugins.module_utils.endpoints.v1.nd_manage_policies.policy_actions import (
-    EpManagePolicyActionsMarkDelete,
-    EpManagePolicyActionsPushConfig,
-    EpManagePolicyActionsRemove,
+    EpManagePolicyActionsMarkDeletePost,
+    EpManagePolicyActionsPushConfigPost,
+    EpManagePolicyActionsRemovePost,
 )
 from ansible_collections.cisco.nd.plugins.module_utils.models.nd_manage_policies.policy_base import (
     PolicyCreate,
@@ -73,7 +76,9 @@ class NDPolicyModule:
         - Idempotent diff calculation across 16 merged / 13 query / 16 deleted cases
         - Create, update, delete_and_create actions
         - Bulk deploy via pushConfig
-        - 3-step delete flow: markDelete → pushConfig → remove
+        - Conditional delete flow:
+          deploy=true  → markDelete → pushConfig → remove
+          deploy=false → markDelete only
 
     Schema models (from ``models.nd_manage_policies``):
         - ``PolicyCreate``      - single policy create request body
@@ -150,7 +155,8 @@ class NDPolicyModule:
         Reads ``self.state`` and delegates to the appropriate handler:
             - **merged**  - create / update / skip policies
             - **query**   - read-only lookup
-            - **deleted** - markDelete → pushConfig → remove
+            - **deleted** - deploy=true: markDelete → pushConfig → remove
+                          - deploy=false: markDelete only
 
         Before dispatching to the state handler, ``_validate_config()`` is
         called to perform upfront validation.  When ``use_desc_as_key=true``
@@ -1586,14 +1592,15 @@ class NDPolicyModule:
 
         Collects all policy IDs to delete across all config entries, then
         performs bulk API calls:
-            - deploy=true:  markDelete → pushConfig → remove  (3-step)
-            - deploy=false: remove only                       (1-step)
+            - deploy=true:  markDelete → pushConfig → remove → shadow cleanup (4-step)
+            - deploy=false: markDelete only                   (1-step)
         """
         self.log.debug("ENTER: _execute_deleted()")
         self.log.debug(f"Processing {len(diff_results)} delete entries")
 
         # Phase A: Register per-entry results and collect all policy IDs
         all_policy_ids_to_delete = []
+        all_switch_ids = []
 
         for diff_entry in diff_results:
             action = diff_entry["action"]
@@ -1649,6 +1656,12 @@ class NDPolicyModule:
                     f"Marking {len(policy_ids)} policy(ies) for deletion: {policy_ids}"
                 )
                 all_policy_ids_to_delete.extend(policy_ids)
+
+                # Collect switch IDs for shadow cleanup later
+                for p in policies:
+                    sw = p.get("switchId", "")
+                    if sw and sw not in all_switch_ids:
+                        all_switch_ids.append(sw)
 
                 if self.check_mode:
                     self.log.info(f"Check mode: would delete {len(policy_ids)} policy(ies)")
@@ -1710,31 +1723,41 @@ class NDPolicyModule:
             f"(deduplicated from {len(all_policy_ids_to_delete)})"
         )
 
-        # Step 1 (deploy=true only): markDelete — flag policies for deletion
-        if self.deploy:
-            self.log.info(f"Step 1/3: markDelete for {len(unique_policy_ids)} policies")
-            self._api_mark_delete(unique_policy_ids)
+        # Step 1: markDelete — always flag policies for deletion
+        self.log.info(
+            f"{'Step 1/4' if self.deploy else 'Step 1/1'}: "
+            f"markDelete for {len(unique_policy_ids)} policies"
+        )
+        self._api_mark_delete(unique_policy_ids)
 
-            self.results.action = "policy_mark_delete"
-            self.results.state = "deleted"
-            self.results.check_mode = self.check_mode
-            self.results.operation_type = OperationType.DELETE
-            self.results.response_current = self.nd.rest_send.response_current
-            self.results.result_current = self.nd.rest_send.result_current
-            self.results.diff_current = {
-                "action": "mark_delete",
-                "policy_ids": unique_policy_ids,
-            }
-            self.results.register_task_result()
+        self.results.action = "policy_mark_delete"
+        self.results.state = "deleted"
+        self.results.check_mode = self.check_mode
+        self.results.operation_type = OperationType.DELETE
+        self.results.response_current = self.nd.rest_send.response_current
+        self.results.result_current = self.nd.rest_send.result_current
+        self.results.diff_current = {
+            "action": "mark_delete",
+            "policy_ids": unique_policy_ids,
+        }
+        self.results.register_task_result()
 
         # Step 2 (deploy=true only): pushConfig — push negation config to switches
         if self.deploy:
-            self.log.info(f"Step 2/3: pushConfig for {len(unique_policy_ids)} policies")
+            self.log.info(f"Step 2/4: pushConfig for {len(unique_policy_ids)} policies")
             self._deploy_policies(unique_policy_ids, state="deleted")
+
+        # deploy=false legacy behavior: stop after markDelete
+        if not self.deploy:
+            self.log.info(
+                "Deploy=false: skipping pushConfig/remove; policies remain marked for deletion"
+            )
+            self.log.debug("EXIT: _execute_deleted()")
+            return
 
         # Step 3: remove — hard-delete policy records from NDFC
         self.log.info(
-            f"{'Step 3/3' if self.deploy else 'Step 1/1'}: "
+            "Step 3/4: "
             f"remove {len(unique_policy_ids)} policies"
         )
         self._api_remove_policies(unique_policy_ids)
@@ -1750,6 +1773,15 @@ class NDPolicyModule:
             "policy_ids": unique_policy_ids,
         }
         self.results.register_task_result()
+
+        # Step 4: cleanup shadow/companion policies
+        # NDFC creates companion ``switch_freeform_config`` policies for
+        # ``switch_freeform`` templates.  The bulk remove only deletes the
+        # parent; the shadows remain with markDeleted=True and negative
+        # priority.  Clean them up via individual DELETE calls.
+        self.log.info("Step 4/4: shadow policy cleanup")
+        self._cleanup_shadow_policies(unique_policy_ids, all_switch_ids)
+
         self.log.debug("EXIT: _execute_deleted()")
 
     # =========================================================================
@@ -1795,7 +1827,7 @@ class NDPolicyModule:
 
         push_body = PolicyIds(policy_ids=policy_ids)
 
-        ep = EpManagePolicyActionsPushConfig()
+        ep = EpManagePolicyActionsPushConfigPost()
         ep.fabric_name = self.fabric_name
         if self.cluster_name:
             ep.endpoint_params.cluster_name = self.cluster_name
@@ -1930,7 +1962,7 @@ class NDPolicyModule:
         self.log.info(f"Marking {len(policy_ids)} policies for deletion: {policy_ids}")
         body = PolicyIds(policy_ids=policy_ids)
 
-        ep = EpManagePolicyActionsMarkDelete()
+        ep = EpManagePolicyActionsMarkDeletePost()
         ep.fabric_name = self.fabric_name
         if self.cluster_name:
             ep.endpoint_params.cluster_name = self.cluster_name
@@ -1948,7 +1980,7 @@ class NDPolicyModule:
         self.log.info(f"Removing {len(policy_ids)} policies: {policy_ids}")
         body = PolicyIds(policy_ids=policy_ids)
 
-        ep = EpManagePolicyActionsRemove()
+        ep = EpManagePolicyActionsRemovePost()
         ep.fabric_name = self.fabric_name
         if self.cluster_name:
             ep.endpoint_params.cluster_name = self.cluster_name
@@ -1956,6 +1988,141 @@ class NDPolicyModule:
             ep.endpoint_params.ticket_id = self.ticket_id
 
         self.nd.request(ep.path, ep.verb, body.to_request_dict())
+
+    def _api_delete_policy(self, policy_id: str) -> None:
+        """Delete a single policy via DELETE /policies/{policyId}.
+
+        This is used to clean up shadow/companion ``switch_freeform_config``
+        policies that are not removed by the bulk ``remove`` action.
+
+        Args:
+            policy_id: Policy ID to delete (e.g., "POLICY-12345").
+        """
+        self.log.info(f"Deleting individual policy: {policy_id}")
+
+        ep = EpManagePoliciesDelete()
+        ep.fabric_name = self.fabric_name
+        ep.policy_id = policy_id
+        if self.cluster_name:
+            ep.endpoint_params.cluster_name = self.cluster_name
+        if self.ticket_id:
+            ep.endpoint_params.ticket_id = self.ticket_id
+
+        self.nd.request(ep.path, ep.verb)
+
+    def _cleanup_shadow_policies(
+        self, parent_policy_ids: List[str], switch_ids: List[str]
+    ) -> None:
+        """Remove shadow/companion policies left behind after bulk remove.
+
+        ## Background — ``switch_freeform`` shadow policies
+
+        NDFC treats the ``switch_freeform`` template specially because it is
+        a **PYTHON content-type** template.  When you create a
+        ``switch_freeform`` policy, NDFC automatically creates a companion
+        ``switch_freeform_config`` (TEMPLATE_CLI content-type) policy that
+        holds the actual generated CLI config.
+
+        The companion has:
+
+        - ``source`` = parent ``switch_freeform`` policy ID
+        - ``templateName`` = ``switch_freeform_config``
+        - Same ``description``, ``switchId``, ``priority`` as the parent
+
+        During deletion:
+
+        1. ``markDelete`` **fails** for the PYTHON parent ("Policies with
+           content type PYTHON or without generated config can't be mark
+           deleted") but **succeeds** for the TEMPLATE_CLI companion
+           (negates priority, sets ``markDeleted=True``).
+        2. ``pushConfig`` deploys the negation config from the companion.
+        3. ``remove`` deletes the **parent** but leaves the **companion**
+           behind as a stale record.
+
+        This method queries each affected switch for policies whose
+        ``source`` matches a removed parent and deletes them individually
+        via ``DELETE /policies/{policyId}``.
+
+        This is the equivalent of the legacy ``dcnm_policy`` workaround
+        that uses a direct ``DELETE`` instead of ``markDelete`` for
+        ``switch_freeform`` templates.
+
+        Note: This behavior is specific to ``switch_freeform`` — other
+        templates (e.g., ``feature_enable``) are TEMPLATE_CLI content-type
+        and do not produce companion policies.
+
+        Args:
+            parent_policy_ids: List of parent policy IDs that were just removed.
+            switch_ids: List of switch serial numbers that had policies deleted.
+        """
+        if not parent_policy_ids or not switch_ids:
+            self.log.info("No shadow policies to clean up (no parents or switches)")
+            return
+
+        parent_set = set(parent_policy_ids)
+        unique_switches = list(dict.fromkeys(switch_ids))
+
+        # Query each switch for ALL policies (unfiltered — including
+        # markDeleted and source != "") to find stale companions.
+        shadow_ids = []
+        for switch_id in unique_switches:
+            ep = EpManagePoliciesGet()
+            ep.fabric_name = self.fabric_name
+            if self.cluster_name:
+                ep.endpoint_params.cluster_name = self.cluster_name
+            ep.lucene_params.filter = f"switchId:{switch_id}"
+            ep.lucene_params.max = 10000
+
+            try:
+                data = self.nd.request(ep.path, ep.verb)
+            except Exception:  # noqa: BLE001
+                self.log.warning(
+                    f"Failed to query policies for switch {switch_id} "
+                    "during shadow cleanup, skipping"
+                )
+                continue
+
+            all_policies = data.get("policies", []) if isinstance(data, dict) else []
+            for p in all_policies:
+                if p.get("source", "") in parent_set:
+                    shadow_ids.append(p["policyId"])
+
+        if not shadow_ids:
+            self.log.info("No shadow policies found — nothing to clean up")
+            return
+
+        self.log.info(
+            f"Found {len(shadow_ids)} shadow policies to clean up: {shadow_ids}"
+        )
+
+        # Delete each shadow individually via DELETE /policies/{policyId}
+        deleted = []
+        for shadow_id in shadow_ids:
+            try:
+                self._api_delete_policy(shadow_id)
+                deleted.append(shadow_id)
+            except Exception:  # noqa: BLE001
+                self.log.warning(
+                    f"Failed to delete shadow policy {shadow_id}, skipping"
+                )
+
+        if deleted:
+            self.results.action = "policy_shadow_cleanup"
+            self.results.state = "deleted"
+            self.results.check_mode = self.check_mode
+            self.results.operation_type = OperationType.DELETE
+            self.results.response_current = {
+                "RETURN_CODE": 200,
+                "MESSAGE": f"Cleaned up {len(deleted)} shadow policies",
+                "DATA": {"shadow_policy_ids": deleted},
+            }
+            self.results.result_current = {"success": True, "changed": True}
+            self.results.diff_current = {
+                "action": "shadow_cleanup",
+                "shadow_policy_ids": deleted,
+                "parent_policy_ids": parent_policy_ids,
+            }
+            self.results.register_task_result()
 
     # =========================================================================
     # Results Helper

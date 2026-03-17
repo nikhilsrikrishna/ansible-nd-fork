@@ -52,7 +52,7 @@ COMMON_CONFIG = ConfigDict(validate_assignment=True)
 # ============================================================================
 
 
-class EpManagePolicyActionsMarkDelete(FabricNameMixin, BaseModel):
+class EpManagePolicyActionsMarkDeletePost(FabricNameMixin, BaseModel):
     """
     # Summary
 
@@ -74,7 +74,7 @@ class EpManagePolicyActionsMarkDelete(FabricNameMixin, BaseModel):
     ## Usage
 
     ```python
-    request = EpManagePolicyActionsMarkDelete()
+    request = EpManagePolicyActionsMarkDeletePost()
     request.fabric_name = "my-fabric"
 
     path = request.path
@@ -97,8 +97,8 @@ class EpManagePolicyActionsMarkDelete(FabricNameMixin, BaseModel):
 
     model_config = COMMON_CONFIG
 
-    class_name: Literal["EpManagePolicyActionsMarkDelete"] = Field(
-        default="EpManagePolicyActionsMarkDelete",
+    class_name: Literal["EpManagePolicyActionsMarkDeletePost"] = Field(
+        default="EpManagePolicyActionsMarkDeletePost",
         description="Class name for backward compatibility",
     )
     endpoint_params: PolicyMutationEndpointParams = Field(
@@ -128,7 +128,7 @@ class EpManagePolicyActionsMarkDelete(FabricNameMixin, BaseModel):
 # ============================================================================
 
 
-class EpManagePolicyActionsPushConfig(FabricNameMixin, BaseModel):
+class EpManagePolicyActionsPushConfigPost(FabricNameMixin, BaseModel):
     """
     # Summary
 
@@ -150,7 +150,7 @@ class EpManagePolicyActionsPushConfig(FabricNameMixin, BaseModel):
     ## Usage
 
     ```python
-    request = EpManagePolicyActionsPushConfig()
+    request = EpManagePolicyActionsPushConfigPost()
     request.fabric_name = "my-fabric"
 
     path = request.path
@@ -173,8 +173,8 @@ class EpManagePolicyActionsPushConfig(FabricNameMixin, BaseModel):
 
     model_config = COMMON_CONFIG
 
-    class_name: Literal["EpManagePolicyActionsPushConfig"] = Field(
-        default="EpManagePolicyActionsPushConfig",
+    class_name: Literal["EpManagePolicyActionsPushConfigPost"] = Field(
+        default="EpManagePolicyActionsPushConfigPost",
         description="Class name for backward compatibility",
     )
     endpoint_params: PolicyPushConfigEndpointParams = Field(
@@ -204,7 +204,7 @@ class EpManagePolicyActionsPushConfig(FabricNameMixin, BaseModel):
 # ============================================================================
 
 
-class EpManagePolicyActionsRemove(FabricNameMixin, BaseModel):
+class EpManagePolicyActionsRemovePost(FabricNameMixin, BaseModel):
     """
     # Summary
 
@@ -226,7 +226,7 @@ class EpManagePolicyActionsRemove(FabricNameMixin, BaseModel):
     ## Usage
 
     ```python
-    request = EpManagePolicyActionsRemove()
+    request = EpManagePolicyActionsRemovePost()
     request.fabric_name = "my-fabric"
 
     path = request.path
@@ -249,8 +249,8 @@ class EpManagePolicyActionsRemove(FabricNameMixin, BaseModel):
 
     model_config = COMMON_CONFIG
 
-    class_name: Literal["EpManagePolicyActionsRemove"] = Field(
-        default="EpManagePolicyActionsRemove",
+    class_name: Literal["EpManagePolicyActionsRemovePost"] = Field(
+        default="EpManagePolicyActionsRemovePost",
         description="Class name for backward compatibility",
     )
     endpoint_params: PolicyMutationEndpointParams = Field(

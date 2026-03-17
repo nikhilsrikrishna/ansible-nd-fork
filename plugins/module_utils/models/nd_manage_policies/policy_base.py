@@ -1,18 +1,20 @@
 # -*- coding: utf-8 -*-
 
-# Copyright: (c) 2026, Cisco Systems
+# Copyright: (c) 2026, L Nikhil Sri Krishna (@nisaikri) <nisaikri@cisco.com>
+
 # GNU General Public License v3.0+ (see LICENSE or https://www.gnu.org/licenses/gpl-3.0.txt)
 
 """
-Base Pydantic model and enum for Policy API request bodies.
+Base Pydantic model for Policy API request bodies.
 
-This module provides the foundational ``PolicyCreate`` model and its
-``PolicyEntityType`` enum.  All other policy models that extend or wrap
-``PolicyCreate`` live in separate files and import from here.
+This module provides the foundational ``PolicyCreate`` model.  All other
+policy models that extend or wrap ``PolicyCreate`` live in separate files
+and import from here.
+
+The ``PolicyEntityType`` enum is in ``enums.py``.
 
 ## Schema origin (manage.json)
 
-- ``PolicyEntityType`` ← ``policyEntityType`` enum
 - ``PolicyCreate``     ← ``createPolicy`` (extends ``createBasePolicy``)
 """
 
@@ -24,31 +26,14 @@ __metaclass__ = type
 
 __author__ = "L Nikhil Sri Krishna"
 
-from enum import Enum
-from typing import Any, Dict, Optional
+from typing import Any, ClassVar, Dict, List, Literal, Optional
 
 from ansible_collections.cisco.nd.plugins.module_utils.common.pydantic_compat import (
-    BaseModel,
-    ConfigDict,
     Field,
 )
+from ansible_collections.cisco.nd.plugins.module_utils.models.base import NDBaseModel
 
-
-# ============================================================================
-# Enums
-# ============================================================================
-
-
-class PolicyEntityType(str, Enum):
-    """
-    Valid entity types for policies.
-
-    Based on policyEntityType schema from manage.json.
-    """
-
-    SWITCH = "switch"
-    CONFIG_PROFILE = "configProfile"
-    INTERFACE = "interface"
+from .enums import PolicyEntityType
 
 
 # ============================================================================
@@ -56,7 +41,7 @@ class PolicyEntityType(str, Enum):
 # ============================================================================
 
 
-class PolicyCreate(BaseModel):
+class PolicyCreate(NDBaseModel):
     """
     Request body model for creating a single policy.
 
@@ -88,6 +73,8 @@ class PolicyCreate(BaseModel):
     ## Usage
 
     ```python
+    from .enums import PolicyEntityType
+
     policy = PolicyCreate(
         switch_id="FDO25031SY4",
         template_name="feature_enable",
@@ -100,11 +87,10 @@ class PolicyCreate(BaseModel):
     ```
     """
 
-    model_config = ConfigDict(
-        validate_assignment=True,
-        use_enum_values=True,
-        populate_by_name=True,
-    )
+    # --- NDBaseModel ClassVars ---
+    identifiers: ClassVar[List[str]] = ["switch_id", "template_name", "description"]
+    identifier_strategy: ClassVar[Optional[Literal["single", "composite", "hierarchical", "singleton"]]] = "composite"
+    exclude_from_diff: ClassVar[set] = {"source"}
 
     # Required fields from createPolicy schema
     switch_id: str = Field(
@@ -167,6 +153,8 @@ class PolicyCreate(BaseModel):
         """
         Convert model to API request dictionary with camelCase keys.
 
+        Delegates to ``NDBaseModel.to_payload()`` for consistency.
+
         ## Returns
 
         Dictionary suitable for JSON request body, excluding None values.
@@ -184,4 +172,4 @@ class PolicyCreate(BaseModel):
         # {"switchId": "FDO123", "templateName": "feature_enable", ...}
         ```
         """
-        return self.model_dump(by_alias=True, exclude_none=True)
+        return self.to_payload()

@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 
-# Copyright: (c) 2026, Cisco Systems
+# Copyright: (c) 2026, L Nikhil Sri Krishna (@nisaikri) <nisaikri@cisco.com>
+
 # GNU General Public License v3.0+ (see LICENSE or https://www.gnu.org/licenses/gpl-3.0.txt)
 
 """
@@ -24,13 +25,12 @@ __metaclass__ = type
 
 __author__ = "L Nikhil Sri Krishna"
 
-from typing import Any, Dict, List
+from typing import Any, ClassVar, Dict, List
 
 from ansible_collections.cisco.nd.plugins.module_utils.common.pydantic_compat import (
-    BaseModel,
-    ConfigDict,
     Field,
 )
+from ansible_collections.cisco.nd.plugins.module_utils.models.nested import NDNestedModel
 from ansible_collections.cisco.nd.plugins.module_utils.models.nd_manage_policies.policy_base import (
     PolicyCreate,
 )
@@ -41,7 +41,7 @@ from ansible_collections.cisco.nd.plugins.module_utils.models.nd_manage_policies
 # ============================================================================
 
 
-class PolicyCreateBulk(BaseModel):
+class PolicyCreateBulk(NDNestedModel):
     """
     Request body model for creating multiple policies in bulk.
 
@@ -58,6 +58,8 @@ class PolicyCreateBulk(BaseModel):
     ```python
     from ansible_collections.cisco.nd.plugins.module_utils.models.nd_manage_policies.policy_base import (
         PolicyCreate,
+    )
+    from ansible_collections.cisco.nd.plugins.module_utils.models.nd_manage_policies.enums import (
         PolicyEntityType,
     )
 
@@ -81,7 +83,7 @@ class PolicyCreateBulk(BaseModel):
     ```
     """
 
-    model_config = ConfigDict(validate_assignment=True)
+    identifiers: ClassVar[List[str]] = []
 
     policies: List[PolicyCreate] = Field(
         default_factory=list,
@@ -126,6 +128,8 @@ class PolicyUpdate(PolicyCreate):
     ## Usage
 
     ```python
+    from .enums import PolicyEntityType
+
     update = PolicyUpdate(
         switch_id="FDO25031SY4",
         template_name="feature_enable",
@@ -138,12 +142,6 @@ class PolicyUpdate(PolicyCreate):
     payload = update.to_request_dict()
     ```
     """
-
-    model_config = ConfigDict(
-        validate_assignment=True,
-        use_enum_values=True,
-        populate_by_name=True,
-    )
 
     # All fields inherited from PolicyCreate
     # policyPut schema is identical to createPolicy per manage.json

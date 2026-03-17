@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 
-# Copyright: (c) 2026, Cisco Systems
+# Copyright: (c) 2026, L Nikhil Sri Krishna (@nisaikri) <nisaikri@cisco.com>
+
 # GNU General Public License v3.0+ (see LICENSE or https://www.gnu.org/licenses/gpl-3.0.txt)
 
 """
@@ -26,17 +27,16 @@ __metaclass__ = type
 
 __author__ = "L Nikhil Sri Krishna"
 
-from typing import Any, Dict, List
+from typing import Any, ClassVar, Dict, List
 
 from ansible_collections.cisco.nd.plugins.module_utils.common.pydantic_compat import (
-    BaseModel,
-    ConfigDict,
     Field,
     field_validator,
 )
+from ansible_collections.cisco.nd.plugins.module_utils.models.nested import NDNestedModel
 
 
-class PolicyIds(BaseModel):
+class PolicyIds(NDNestedModel):
     """
     Request body model for policy bulk actions.
 
@@ -77,10 +77,7 @@ class PolicyIds(BaseModel):
     ```
     """
 
-    model_config = ConfigDict(
-        validate_assignment=True,
-        populate_by_name=True,
-    )
+    identifiers: ClassVar[List[str]] = []
 
     policy_ids: List[str] = Field(
         default_factory=list,
@@ -118,6 +115,8 @@ class PolicyIds(BaseModel):
         """
         Convert to API request dictionary with camelCase keys.
 
+        Delegates to ``NDBaseModel.to_payload()`` for consistency.
+
         ## Returns
 
         Dictionary suitable for JSON request body.
@@ -130,4 +129,4 @@ class PolicyIds(BaseModel):
         # {"policyIds": ["POLICY-123", "POLICY-456"]}
         ```
         """
-        return self.model_dump(by_alias=True, exclude_none=True)
+        return self.to_payload()

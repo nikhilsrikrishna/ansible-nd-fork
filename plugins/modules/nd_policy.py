@@ -20,7 +20,6 @@ module: nd_policy
 version_added: "1.0.0"
 short_description: Manages policies on Nexus Dashboard Fabric Controller (NDFC).
 description:
-- Manages switch policies on Cisco Nexus Dashboard Fabric Controller (NDFC) 4.x.
 - Supports creating, updating, deleting, querying, and deploying policies based on templates.
 - Supports C(merged) state for idempotent policy management.
 - Supports C(deleted) state for removing policies from NDFC and optionally from switches.
@@ -109,6 +108,8 @@ options:
       entity_type:
         description:
         - Type of entity the policy applies to.
+        - Only V(switch) is supported with C(merged) state. For V(configProfile) and V(interface),
+          only C(query) and C(deleted) states are allowed.
         type: str
         choices: [ switch, configProfile, interface ]
         default: switch
@@ -130,6 +131,9 @@ options:
           serial_number:
             description:
             - Serial number of the target switch (e.g., C(FDO25031SY4)).
+            - The alias C(ip) is kept for backward compatibility and may be a
+              switch management IP or hostname. The module resolves that value
+              to the switch serial number before calling policy APIs.
             type: str
             required: true
             aliases: [ ip ]
@@ -183,6 +187,7 @@ options:
     - When set to V(true), policies are deployed to devices after create/update/delete operations.
     - For C(merged) state, this triggers a pushConfig action for the affected policy IDs.
     - For C(deleted) state, this triggers markDelete + pushConfig (to remove config from switches) before hard-deleting.
+    - For C(deleted) with O(deploy=false), policies are only marked for deletion on the controller (no pushConfig, no hard-delete).
     type: bool
     default: true
   ticket_id:
@@ -197,7 +202,11 @@ options:
   state:
     description:
     - Use C(merged) to create or update policies.
-    - Use C(deleted) to remove policies. When O(deploy=true), config is removed from switches first.
+    - Use C(deleted) to delete policies.
+    - For C(deleted) with O(deploy=true), the module performs:
+      C(markDelete) -> C(pushConfig) -> C(remove).
+    - For C(deleted) with O(deploy=false), only C(markDelete) is performed on the controller.
+      Policy records remain marked for deletion until a later remove operation.
     - Use C(query) to retrieve existing policies without making changes.
     type: str
     choices: [ merged, deleted, query ]
@@ -442,6 +451,7 @@ import logging
 
 from ansible.module_utils.basic import AnsibleModule
 from ansible_collections.cisco.nd.plugins.module_utils.common.log import Log
+from ansible_collections.cisco.nd.plugins.module_utils.endpoints.v1.base_paths_manage import BasePath
 from ansible_collections.cisco.nd.plugins.module_utils.nd_policy_resources import NDPolicyModule
 from ansible_collections.cisco.nd.plugins.module_utils.nd_v2 import (
     NDModule,
@@ -559,6 +569,157 @@ def _translate_config(config, use_desc_as_key):
     return result
 
 
+def _looks_like_ip(value):
+    """Return True if value looks like an IPv4 address (simple heuristic)."""
+    parts = value.split(".")
+    if len(parts) == 4:
+        return all(p.isdigit() and 0 <= int(p) <= 255 for p in parts)
+    return False
+
+
+def _needs_resolution(value):
+    """Return True if the switch identifier needs IP/hostname-to-serial resolution.
+
+    Serial numbers are alphanumeric strings (e.g. FDO25031SY4).
+    IPs look like dotted quads.  Hostnames contain dots or look like FQDNs.
+    If the value is already a serial number we can skip the fabric API call.
+    """
+    if not value:
+        return False
+    v = str(value).strip()
+    # IPv4 address
+    if _looks_like_ip(v):
+        return True
+    # Hostname / FQDN (contains a dot but isn't an IP)
+    if "." in v:
+        return True
+    return False
+
+
+def _query_fabric_switches(nd, fabric_name):
+    """Query all switches for a fabric and return raw switch records.
+
+    Uses RestSend save_settings/restore_settings to temporarily force
+    check_mode=False so that this read-only GET always hits the controller,
+    even when the module is running in Ansible check mode.
+    """
+    path = f"{BasePath.nd_manage_fabrics(fabric_name, 'switches')}?max=10000"
+
+    # Temporarily disable check_mode for this read-only lookup so the
+    # controller is queried even when Ansible runs with --check.
+    rest_send = nd._get_rest_send()
+    rest_send.save_settings()
+    rest_send.check_mode = False
+    try:
+        response = nd.request(path)
+    finally:
+        rest_send.restore_settings()
+
+    if isinstance(response, list):
+        return response
+    if isinstance(response, dict):
+        return response.get("switches", [])
+    return []
+
+
+def _translate_switch_identifiers(config, nd, fabric_name, module):
+    """Resolve switch IP/hostname inputs to policy API serial numbers.
+
+    The user's arg-spec field is ``serial_number`` with alias ``ip``.
+    Ansible normalises both into ``serial_number``.  After
+    ``_translate_config`` the value lives in ``entry["switch"]`` as a
+    plain string.
+
+    Resolution logic:
+        1. If the value does NOT look like an IP or hostname it is
+           assumed to be a serial number already → pass through as-is.
+        2. If the value looks like an IP or hostname, query the fabric
+           switch inventory and resolve it to a serial number.
+        3. If resolution fails, raise a clear error.
+    """
+    if config is None:
+        return []
+
+    # Collect unique identifiers that actually need resolution
+    needs_lookup = set()
+    for entry in config:
+        switch_value = entry.get("switch")
+        if isinstance(switch_value, list):
+            for switch_entry in switch_value:
+                val = switch_entry.get("serial_number") or switch_entry.get("ip") or ""
+                if _needs_resolution(val):
+                    needs_lookup.add(val)
+        elif isinstance(switch_value, str) and _needs_resolution(switch_value):
+            needs_lookup.add(switch_value)
+
+    # Only call the fabric API if there are identifiers to resolve
+    if not needs_lookup:
+        return config
+
+    switches = _query_fabric_switches(nd, fabric_name)
+
+    ip_map = {}
+    hostname_map = {}
+
+    for switch in switches:
+        switch_id = switch.get("switchId") or switch.get("serialNumber")
+        if not switch_id:
+            continue
+
+        fabric_ip = switch.get("fabricManagementIp") or switch.get("ip")
+        if fabric_ip:
+            ip_map[str(fabric_ip).strip()] = switch_id
+
+        hostname = switch.get("hostname")
+        if hostname:
+            hostname_map[str(hostname).strip().lower()] = switch_id
+
+    def resolve(identifier):
+        if identifier is None:
+            return None
+        value = str(identifier).strip()
+        if not value:
+            return value
+        # Try IP map first, then hostname map
+        return ip_map.get(value) or hostname_map.get(value.lower())
+
+    for entry in config:
+        switch_value = entry.get("switch")
+
+        if isinstance(switch_value, list):
+            for switch_entry in switch_value:
+                original = switch_entry.get("serial_number") or switch_entry.get("ip")
+                if not _needs_resolution(original):
+                    continue  # Already a serial number — leave it alone
+                resolved = resolve(original)
+                if resolved is None:
+                    module.fail_json(
+                        msg=(
+                            f"Unable to resolve switch identifier '{original}' to a serial number "
+                            f"in fabric '{fabric_name}'. Provide a valid switch serial_number, "
+                            "management IP, or hostname from the fabric inventory."
+                        )
+                    )
+                switch_entry["serial_number"] = resolved
+                if "ip" in switch_entry:
+                    switch_entry["ip"] = resolved
+        elif isinstance(switch_value, str):
+            if not _needs_resolution(switch_value):
+                continue  # Already a serial number — leave it alone
+            resolved = resolve(switch_value)
+            if resolved is None:
+                module.fail_json(
+                    msg=(
+                        f"Unable to resolve switch identifier '{switch_value}' to a serial number "
+                        f"in fabric '{fabric_name}'. Provide a valid switch serial_number, "
+                        "management IP, or hostname from the fabric inventory."
+                    )
+                )
+            entry["switch"] = resolved
+
+    return config
+
+
 # =============================================================================
 # Main
 # =============================================================================
@@ -618,27 +779,41 @@ def main():
     state = module.params.get("state")
     use_desc_as_key = module.params.get("use_desc_as_key")
     output_level = module.params.get("output_level")
+    fabric_name = module.params.get("fabric_name")
 
     if not module.params.get("config"):
         module.fail_json(
             msg=f"'config' element is mandatory for state '{state}'."
         )
 
+    try:
+        nd = NDModule(module)
+    except Exception as error:
+        module.fail_json(msg=f"Failed to initialize NDModule: {str(error)}")
+
+    try:
+        translated_input = _translate_switch_identifiers(
+            copy.deepcopy(module.params["config"]),
+            nd,
+            fabric_name,
+            module,
+        )
+    except NDModuleError as error:
+        module.fail_json(
+            msg=(
+                f"Failed to resolve switch identifiers for fabric '{fabric_name}': "
+                f"{error.msg}"
+            )
+        )
+
     # Translate the playbook config: flatten multi-switch structure into
     # one entry per (policy, switch) pair, applying per-switch overrides.
     # This must happen before any state handling so the downstream code
     # operates on a uniform flat list.
-    if state != "query":
-        translated_config = _translate_config(
-            copy.deepcopy(module.params["config"]),
-            use_desc_as_key,
-        )
-    else:
-        # For query state, we still need to translate to expand switches
-        translated_config = _translate_config(
-            copy.deepcopy(module.params["config"]),
-            use_desc_as_key,
-        )
+    translated_config = _translate_config(
+        translated_input,
+        use_desc_as_key,
+    )
 
     # Validate: name is required for merged state
     if state == "merged":
@@ -646,6 +821,19 @@ def main():
             if not entry.get("name"):
                 module.fail_json(
                     msg=f"config[{idx}].name is required when state=merged."
+                )
+
+    # Validate: merged state is only supported for entity_type=switch
+    if state == "merged":
+        for idx, entry in enumerate(translated_config):
+            entity_type = entry.get("entity_type", "switch")
+            if entity_type != "switch":
+                module.fail_json(
+                    msg=(
+                        f"config[{idx}]: entity_type='{entity_type}' is not supported "
+                        f"with state=merged. Only entity_type='switch' supports merged state. "
+                        f"Use state=query or state=deleted for entity_type='{entity_type}'."
+                    )
                 )
 
     # Validate: every translated entry must have a switch
@@ -668,8 +856,6 @@ def main():
     try:
         log.info(f"Starting nd_policy module: state={state}")
 
-        # Initialize NDModule (uses RestSend infrastructure internally)
-        nd = NDModule(module)
         log.info("NDModule initialized successfully")
 
         # Create NDPolicyModule
