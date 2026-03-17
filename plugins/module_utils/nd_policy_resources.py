@@ -37,16 +37,16 @@ import re
 from typing import Any, Dict, List, Optional, Tuple
 
 from ansible_collections.cisco.nd.plugins.module_utils.enums import OperationType
-from ansible_collections.cisco.nd.plugins.module_utils.endpoints.v1.nd_manage_policies.config_templates import (
+from ansible_collections.cisco.nd.plugins.module_utils.endpoints.v1.manage.nd_manage_policies.config_templates import (
     EpManageConfigTemplateParametersGet,
 )
-from ansible_collections.cisco.nd.plugins.module_utils.endpoints.v1.nd_manage_policies.policies import (
+from ansible_collections.cisco.nd.plugins.module_utils.endpoints.v1.manage.nd_manage_policies.policies import (
     EpManagePoliciesDelete,
     EpManagePoliciesGet,
     EpManagePoliciesPost,
     EpManagePoliciesPut,
 )
-from ansible_collections.cisco.nd.plugins.module_utils.endpoints.v1.nd_manage_policies.policy_actions import (
+from ansible_collections.cisco.nd.plugins.module_utils.endpoints.v1.manage.nd_manage_policies.policy_actions import (
     EpManagePolicyActionsMarkDeletePost,
     EpManagePolicyActionsPushConfigPost,
     EpManagePolicyActionsRemovePost,

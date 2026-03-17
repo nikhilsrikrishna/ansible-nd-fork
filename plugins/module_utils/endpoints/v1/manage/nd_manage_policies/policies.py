@@ -38,7 +38,7 @@ from ansible_collections.cisco.nd.plugins.module_utils.endpoints.query_params im
 from ansible_collections.cisco.nd.plugins.module_utils.endpoints.v1.base_paths_manage import (
     BasePath,
 )
-from ansible_collections.cisco.nd.plugins.module_utils.endpoints.v1.nd_manage_policies.query_params import (
+from ansible_collections.cisco.nd.plugins.module_utils.endpoints.v1.manage.nd_manage_policies.query_params import (
     PoliciesEndpointParams,
     PolicyMutationEndpointParams,
 )
