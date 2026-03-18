@@ -186,8 +186,14 @@ options:
     description:
     - When set to V(true), policies are deployed to devices after create/update/delete operations.
     - For C(merged) state, this triggers a pushConfig action for the affected policy IDs.
-    - For C(deleted) state, this triggers markDelete + pushConfig (to remove config from switches) before hard-deleting.
-    - For C(deleted) with O(deploy=false), policies are only marked for deletion on the controller (no pushConfig, no hard-delete).
+    - For C(deleted) state, this triggers C(markDelete) → C(pushConfig) → C(remove) to remove
+      config from switches and then hard-delete the policy records from the controller.
+    - For C(deleted) with O(deploy=false), only C(markDelete) is performed on the controller.
+      Policy records remain marked for deletion (with negative priority) until a subsequent
+      run with O(deploy=true) or manual intervention.
+    - B(Exception) — C(switch_freeform) policies are always deleted via a direct C(DELETE)
+      API call regardless of the O(deploy) setting, because the C(markDelete) operation
+      is not supported for this template.
     type: bool
     default: true
   ticket_id:
@@ -203,10 +209,13 @@ options:
     description:
     - Use C(merged) to create or update policies.
     - Use C(deleted) to delete policies.
-    - For C(deleted) with O(deploy=true), the module performs:
-      C(markDelete) -> C(pushConfig) -> C(remove).
+    - For C(deleted) with O(deploy=true), the module performs
+      C(markDelete) → C(pushConfig) → C(remove).
     - For C(deleted) with O(deploy=false), only C(markDelete) is performed on the controller.
-      Policy records remain marked for deletion until a later remove operation.
+      Policy records remain marked for deletion (with negative priority) until a subsequent
+      run with O(deploy=true) or manual intervention.
+    - B(Exception) — C(switch_freeform) policies skip the C(markDelete) flow entirely
+      and are removed via a direct C(DELETE) API call regardless of the O(deploy) setting.
     - Use C(query) to retrieve existing policies without making changes.
     type: str
     choices: [ merged, deleted, query ]
@@ -225,6 +234,13 @@ notes:
 - When O(use_desc_as_key=true), the description uniquely identifies the policy per switch,
   so in-place updates B(are) supported. If the template name changes, the old policy is
   deleted and a new one is created.
+- C(switch_freeform) policies do not support the C(markDelete) API. They are always
+  removed via a direct C(DELETE) API call, regardless of the O(deploy) setting.
+- If C(pushConfig) fails during a C(deleted) operation (e.g., switch unreachable), the
+  module aborts before the final C(remove) step. Policies remain in a C(markDeleted) state
+  with negative priority. Re-run the task after fixing connectivity to complete the deletion.
+  If a C(merged) task is run while stale C(markDeleted) policies exist, the module
+  automatically cleans them up.
 """
 
 EXAMPLES = r"""
@@ -381,6 +397,39 @@ EXAMPLES = r"""
           - serial_number: "{{ switch1 }}"
           - serial_number: "{{ switch2 }}"
 
+- name: Delete policies without deploying (mark for deletion only)
+  cisco.nd.nd_policy:
+    fabric_name: "{{ fabric_name }}"
+    state: deleted
+    deploy: false
+    config:
+      - name: template_101
+      - switch:
+          - serial_number: "{{ switch1 }}"
+
+# NOTE: switch_freeform policies are always directly deleted
+#       regardless of the deploy setting.
+
+- name: Delete switch_freeform policies (direct DELETE)
+  cisco.nd.nd_policy:
+    fabric_name: "{{ fabric_name }}"
+    state: deleted
+    config:
+      - name: switch_freeform
+      - switch:
+          - serial_number: "{{ switch1 }}"
+
+- name: Delete policies using description as key
+  cisco.nd.nd_policy:
+    fabric_name: "{{ fabric_name }}"
+    use_desc_as_key: true
+    state: deleted
+    config:
+      - name: switch_freeform
+        description: "Enable LACP"
+      - switch:
+          - serial_number: "{{ switch1 }}"
+
 # QUERY
 
 - name: Query all policies from specified switches
@@ -424,6 +473,31 @@ failed:
   returned: always
   type: bool
   sample: false
+before:
+  description:
+  - List of policy snapshots B(before) the module made any changes.
+  - For C(merged) state, contains the existing policy state prior to create/update.
+  - For C(deleted) state, contains the policies that were deleted.
+  - For C(query) state, this is an empty list.
+  returned: always
+  type: list
+  elements: dict
+after:
+  description:
+  - List of policy snapshots B(after) the module completed.
+  - For C(merged) state, contains the new/updated policy state.
+  - For C(deleted) state, this is an empty list (policies were removed).
+  - For C(query) state, contains the queried policies.
+  returned: always
+  type: list
+  elements: dict
+proposed:
+  description:
+  - List of proposed policy changes derived from the playbook config.
+  - Only returned when O(output_level) is set to V(info) or V(debug).
+  returned: when output_level is info or debug
+  type: list
+  elements: dict
 diff:
   description: List of differences between desired and existing state.
   returned: always
@@ -747,6 +821,8 @@ def main():
         description=dict(type="str", default=""),
         priority=dict(type="int", default=500),
         create_additional_policy=dict(type="bool", default=True),
+        entity_name=dict(type="str", default="SWITCH"),
+        entity_type=dict(type="str", default="switch", choices=["switch", "configProfile", "interface"]),
         template_inputs=dict(type="dict", default={}),
         switch=dict(type="list", elements="dict", options=switch_spec),
     )

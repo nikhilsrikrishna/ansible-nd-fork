@@ -125,6 +125,12 @@ class NDPolicyModule:
         # same template.
         self._template_params_cache: Dict[str, List[Dict]] = {}
 
+        # Before/after snapshot lists — populated during _execute_* methods.
+        # Merged into exit_json output so the caller sees what changed.
+        self._before: List[Dict] = []
+        self._after: List[Dict] = []
+        self._proposed: List[Dict] = []
+
         self.log.info(
             f"Initialized NDPolicyModule for fabric: {self.fabric_name}, state: {self.state}"
         )
@@ -132,11 +138,20 @@ class NDPolicyModule:
     def exit_json(self) -> None:
         """Build final result from all registered tasks and exit.
 
-        Merges the ``Results`` aggregation and delegates to
-        ``ansible_module.exit_json`` or ``fail_json``.
+        Merges the ``Results`` aggregation and the before/after/proposed
+        snapshot lists, then delegates to ``exit_json`` or ``fail_json``.
         """
         self.results.build_final_result()
         final = self.results.final_result
+
+        # Attach before/after snapshots
+        final["before"] = self._before
+        final["after"] = self._after
+
+        # Only expose proposed at info/debug output levels
+        output_level = self.module.params.get("output_level", "normal")
+        if output_level in ("debug", "info"):
+            final["proposed"] = self._proposed
 
         if True in self.results.failed:
             self.module.fail_json(
@@ -318,9 +333,40 @@ class NDPolicyModule:
         # Phase 4: Deploy if requested
         if self.deploy and policy_ids_to_deploy:
             self.log.info(f"Deploying {len(policy_ids_to_deploy)} policies")
-            self._deploy_policies(policy_ids_to_deploy)
+            deploy_success = self._deploy_policies(policy_ids_to_deploy)
+            if not deploy_success:
+                self.log.error(
+                    "pushConfig failed for one or more policies after "
+                    "create/update. Policies exist on the controller but "
+                    "have not been deployed to the switch."
+                )
+                self._register_result(
+                    action="policy_deploy_failed",
+                    operation_type=OperationType.UPDATE,
+                    return_code=-1,
+                    message=(
+                        "pushConfig failed for one or more policies. "
+                        "Policies were created/updated on the controller but "
+                        "not deployed to the switch. Fix device connectivity "
+                        "and re-run with deploy=true."
+                    ),
+                    success=False,
+                    found=True,
+                    diff={
+                        "action": "deploy_failed",
+                        "policy_ids": policy_ids_to_deploy,
+                        "reason": "pushConfig per-policy failure",
+                    },
+                )
         elif not self.deploy:
             self.log.info("Deploy not requested, skipping pushConfig")
+
+        # Phase 5: Clean up stale markDeleted policies that match the
+        # same switch+template (or switch+description) as policies we
+        # just created or updated.  These remnants are left behind when
+        # a previous delete's pushConfig failed (device unreachable).
+        if not self.check_mode:
+            self._cleanup_stale_mark_deleted(diff_results)
 
         self.log.debug("EXIT: _handle_merged_state()")
 
@@ -476,8 +522,16 @@ class NDPolicyModule:
     # API Query Helpers
     # =========================================================================
 
-    def _query_policies(self, lucene_filter: Optional[str] = None) -> List[Dict]:
-        """Query policies from the controller using GET /policies.
+    def _query_policies_raw(
+        self, lucene_filter: Optional[str] = None
+    ) -> List[Dict]:
+        """Query policies from the controller using GET /policies (unfiltered).
+
+        Returns **all** matching policies including ``markDeleted`` and
+        internal (``source != ""``) entries.  Callers that need the raw
+        list (cleanup routines, query-state display) should use this
+        directly.  For idempotency checks use ``_query_policies()``
+        which filters out stale records.
 
         Args:
             lucene_filter: Optional Lucene filter string.
@@ -485,7 +539,7 @@ class NDPolicyModule:
         Returns:
             List of policy dicts from the response.
         """
-        self.log.debug(f"Querying policies with filter: {lucene_filter}")
+        self.log.debug(f"Querying policies (raw) with filter: {lucene_filter}")
 
         ep = EpManagePoliciesGet()
         ep.fabric_name = self.fabric_name
@@ -498,41 +552,86 @@ class NDPolicyModule:
         ep.lucene_params.max = 10000
 
         data = self.nd.request(ep.path, ep.verb)
-        # Response format: {"policies": [...], "meta": {"counts": {"total": N, "remaining": N}}}
         if isinstance(data, dict):
             policies = data.get("policies", [])
             self.log.debug(f"Raw query returned {len(policies)} policies")
-            # Filter out:
-            # 1. Policies marked for deletion (markDeleted=True) — pending removal,
-            #    should not match for idempotency checks.
-            # 2. Shadow/pending sub-policies (source != "") — when a policy is
-            #    modified but not yet deployed, NDFC creates a shadow copy.
-            #    Including these causes false duplicate matches.
-            filtered = [
-                p for p in policies
-                if not p.get("markDeleted", False)
-                and p.get("source", "") == ""
-            ]
-            self.log.debug(
-                f"After filtering markDeleted/source: {len(filtered)} policies "
-                f"(removed {len(policies) - len(filtered)})"
-            )
-            return filtered
+            return policies
         self.log.debug("Query returned non-dict response, returning empty list")
         return []
 
-    def _query_policy_by_id(self, policy_id: str) -> Optional[Dict]:
+    def _query_policies(
+        self,
+        lucene_filter: Optional[str] = None,
+        include_mark_deleted: bool = False,
+    ) -> List[Dict]:
+        """Query policies with idempotency-safe filtering.
+
+        Wraps ``_query_policies_raw()`` and applies post-filters:
+
+        - **markDeleted** — when ``include_mark_deleted=False`` (default),
+          policies pending deletion are excluded so they don't interfere
+          with idempotency checks.  When ``True``, they are kept and
+          annotated with ``_markDeleted_stale: True`` so callers (e.g.
+          query state) can surface the status to the user.
+        - **source != ""** — internal NDFC sub-policies are always
+          excluded; they are artefacts that cause false duplicate
+          matches.
+
+        Args:
+            lucene_filter: Optional Lucene filter string.
+            include_mark_deleted: When True, keep markDeleted policies
+                and annotate them instead of filtering them out.
+
+        Returns:
+            List of policy dicts from the response.
+        """
+        raw = self._query_policies_raw(lucene_filter)
+        if not raw:
+            return []
+
+        result: List[Dict] = []
+        excluded = 0
+        for p in raw:
+            # Always exclude internal NDFC sub-policies (source != "")
+            if p.get("source", "") != "":
+                excluded += 1
+                continue
+
+            if p.get("markDeleted", False):
+                if include_mark_deleted:
+                    # Annotate so callers can display the status
+                    p["_markDeleted_stale"] = True
+                    result.append(p)
+                else:
+                    excluded += 1
+                continue
+
+            result.append(p)
+
+        self.log.debug(
+            f"After filtering: {len(result)} policies "
+            f"(excluded {excluded}, include_mark_deleted={include_mark_deleted})"
+        )
+        return result
+
+    def _query_policy_by_id(
+        self, policy_id: str, include_mark_deleted: bool = False
+    ) -> Optional[Dict]:
         """Query a single policy by its ID.
 
-        Policies that are marked for deletion (``markDeleted=True``) are
-        treated as non-existent because they are pending removal and
-        cannot be updated.
+        By default, policies marked for deletion (``markDeleted=True``)
+        are treated as non-existent because they are pending removal
+        and cannot be updated.  When ``include_mark_deleted=True`` (used
+        by query state), they are returned with an annotation so the
+        caller can surface the status.
 
         Args:
             policy_id: Policy ID (e.g., "POLICY-121110").
+            include_mark_deleted: When True, return markDeleted policies
+                annotated with ``_markDeleted_stale: True``.
 
         Returns:
-            Policy dict, or None if not found or marked for deletion.
+            Policy dict, or None if not found.
         """
         self.log.debug(f"Looking up policy by ID: {policy_id}")
 
@@ -555,6 +654,12 @@ class NDPolicyModule:
                     )
                     return None
                 if data.get("markDeleted", False):
+                    if include_mark_deleted:
+                        data["_markDeleted_stale"] = True
+                        self.log.info(
+                            f"Policy {policy_id} is marked for deletion (included with annotation)"
+                        )
+                        return data
                     self.log.info(
                         f"Policy {policy_id} is marked for deletion, treating as not found"
                     )
@@ -875,10 +980,15 @@ class NDPolicyModule:
         """
         self.log.debug("ENTER: _build_have()")
 
+        # For query state, include markDeleted policies (annotated) so the
+        # user sees the full picture.  For merged/deleted, exclude them to
+        # avoid false idempotency matches.
+        incl_md = self.state == "query"
+
         # Case A: Policy ID given directly
         if "policyId" in want:
             self.log.debug(f"Case A: Direct policy ID lookup: {want['policyId']}")
-            policy = self._query_policy_by_id(want["policyId"])
+            policy = self._query_policy_by_id(want["policyId"], include_mark_deleted=incl_md)
             if policy:
                 self.log.info(f"Policy {want['policyId']} found")
                 return [policy], None
@@ -889,7 +999,7 @@ class NDPolicyModule:
         if "templateName" not in want:
             self.log.debug(f"Case D: Switch-only lookup for {want['switchId']}")
             lucene = self._build_lucene_filter(switchId=want["switchId"])
-            policies = self._query_policies(lucene)
+            policies = self._query_policies(lucene, include_mark_deleted=incl_md)
             self.log.info(f"Found {len(policies)} policies on switch {want['switchId']}")
             return policies, None
 
@@ -903,7 +1013,7 @@ class NDPolicyModule:
                 switchId=want["switchId"],
                 templateName=want["templateName"],
             )
-            policies = self._query_policies(lucene)
+            policies = self._query_policies(lucene, include_mark_deleted=incl_md)
 
             # If description is provided, use it as an additional post-filter
             want_desc = want.get("description", "")
@@ -934,7 +1044,7 @@ class NDPolicyModule:
             switchId=want["switchId"],
             description=want_desc,
         )
-        policies = self._query_policies(lucene)
+        policies = self._query_policies(lucene, include_mark_deleted=incl_md)
 
         # IMPORTANT: Lucene does tokenized matching, not exact match.
         # Post-filter to ensure exact description match.
@@ -1165,6 +1275,7 @@ class NDPolicyModule:
 
             # --- FAIL ---
             if action == "fail":
+                self._proposed.append(want)
                 self._register_result(
                     action="policy_merged",
                     operation_type=OperationType.QUERY,
@@ -1178,6 +1289,10 @@ class NDPolicyModule:
 
             # --- SKIP ---
             if action == "skip":
+                self._proposed.append(want)
+                if have:
+                    self._before.append(have)
+                    self._after.append(have)  # unchanged
                 diff_payload = {"action": action, "want": want}
                 if error_msg:
                     diff_payload["warning"] = error_msg
@@ -1195,7 +1310,9 @@ class NDPolicyModule:
 
             # --- CREATE ---
             if action == "create":
+                self._proposed.append(want)
                 if self.check_mode:
+                    self._after.append(want)  # would-be state
                     self._register_result(
                         action="policy_create",
                         operation_type=OperationType.CREATE,
@@ -1227,24 +1344,32 @@ class NDPolicyModule:
                 if created_id:
                     policy_ids_to_deploy.append(created_id)
 
-                self.results.response_current = self.nd.rest_send.response_current
-                self.results.result_current = self.nd.rest_send.result_current
-                self.results.diff_current = {
-                    "action": action,
-                    "want": want,
-                    "diff": field_diff,
-                    "created_policy_id": created_id,
-                }
-                self.results.action = "policy_create"
-                self.results.state = "merged"
-                self.results.check_mode = self.check_mode
-                self.results.operation_type = OperationType.CREATE
-                self.results.register_task_result()
+                self._after.append({**want, "policyId": created_id})
+
+                self._register_result(
+                    action="policy_create",
+                    operation_type=OperationType.CREATE,
+                    return_code=200,
+                    message="OK",
+                    success=True,
+                    found=False,
+                    diff={
+                        "action": action,
+                        "before": None,
+                        "after": {**want, "policyId": created_id},
+                        "want": want,
+                        "diff": field_diff,
+                        "created_policy_id": created_id,
+                    },
+                )
                 continue
 
             # --- UPDATE ---
             if action == "update":
+                self._proposed.append(want)
+                self._before.append(have)
                 if self.check_mode:
+                    self._after.append({**have, **want})
                     self._register_result(
                         action="policy_update",
                         operation_type=OperationType.UPDATE,
@@ -1254,6 +1379,8 @@ class NDPolicyModule:
                         found=True,
                         diff={
                             "action": action,
+                            "before": have,
+                            "after": {**have, **want},
                             "want": want,
                             "have": have,
                             "diff": field_diff,
@@ -1265,25 +1392,34 @@ class NDPolicyModule:
                 self._api_update_policy(want, have, policy_id)
                 policy_ids_to_deploy.append(policy_id)
 
-                self.results.response_current = self.nd.rest_send.response_current
-                self.results.result_current = self.nd.rest_send.result_current
-                self.results.diff_current = {
-                    "action": action,
-                    "want": want,
-                    "have": have,
-                    "diff": field_diff,
-                    "policy_id": policy_id,
-                }
-                self.results.action = "policy_update"
-                self.results.state = "merged"
-                self.results.check_mode = self.check_mode
-                self.results.operation_type = OperationType.UPDATE
-                self.results.register_task_result()
+                after_merged = {**have, **want, "policyId": policy_id}
+                self._after.append(after_merged)
+
+                self._register_result(
+                    action="policy_update",
+                    operation_type=OperationType.UPDATE,
+                    return_code=200,
+                    message="OK",
+                    success=True,
+                    found=True,
+                    diff={
+                        "action": action,
+                        "before": have,
+                        "after": after_merged,
+                        "want": want,
+                        "have": have,
+                        "diff": field_diff,
+                        "policy_id": policy_id,
+                    },
+                )
                 continue
 
             # --- DELETE_AND_CREATE ---
             if action == "delete_and_create":
+                self._proposed.append(want)
+                self._before.append(have)
                 if self.check_mode:
+                    self._after.append(want)  # would-be replacement
                     self._register_result(
                         action="policy_replace",
                         operation_type=OperationType.UPDATE,
@@ -1293,6 +1429,8 @@ class NDPolicyModule:
                         found=True,
                         diff={
                             "action": action,
+                            "before": have,
+                            "after": want,
                             "want": want,
                             "have": have,
                             "diff": field_diff,
@@ -1326,21 +1464,26 @@ class NDPolicyModule:
                 if created_id:
                     policy_ids_to_deploy.append(created_id)
 
-                self.results.response_current = self.nd.rest_send.response_current
-                self.results.result_current = self.nd.rest_send.result_current
-                self.results.diff_current = {
-                    "action": action,
-                    "want": want,
-                    "have": have,
-                    "diff": field_diff,
-                    "deleted_policy_id": policy_id,
-                    "created_policy_id": created_id,
-                }
-                self.results.action = "policy_replace"
-                self.results.state = "merged"
-                self.results.check_mode = self.check_mode
-                self.results.operation_type = OperationType.UPDATE
-                self.results.register_task_result()
+                self._after.append({**want, "policyId": created_id})
+
+                self._register_result(
+                    action="policy_replace",
+                    operation_type=OperationType.UPDATE,
+                    return_code=200,
+                    message="OK",
+                    success=True,
+                    found=True,
+                    diff={
+                        "action": action,
+                        "before": have,
+                        "after": {**want, "policyId": created_id},
+                        "want": want,
+                        "have": have,
+                        "diff": field_diff,
+                        "deleted_policy_id": policy_id,
+                        "created_policy_id": created_id,
+                    },
+                )
                 continue
 
         self.log.info(f"Merged execute complete: {len(policy_ids_to_deploy)} policies to deploy")
@@ -1447,6 +1590,7 @@ class NDPolicyModule:
 
             if action == "fail":
                 self.log.warning(f"Query failed: {error_msg}")
+                self._proposed.append(want)
                 self._register_result(
                     action="policy_query",
                     state="query",
@@ -1460,6 +1604,7 @@ class NDPolicyModule:
                 continue
 
             if action == "not_found":
+                self._proposed.append(want)
                 self._register_result(
                     action="policy_query",
                     state="query",
@@ -1473,6 +1618,8 @@ class NDPolicyModule:
                 continue
 
             if action == "found":
+                self._proposed.append(want)
+                self._after.extend(policies)  # query: "after" = what exists now
                 diff_payload = {
                     "action": action,
                     "want": want,
@@ -1591,9 +1738,13 @@ class NDPolicyModule:
         """Execute the computed actions for all deleted config entries.
 
         Collects all policy IDs to delete across all config entries, then
-        performs bulk API calls:
-            - deploy=true:  markDelete → pushConfig → remove → shadow cleanup (4-step)
-            - deploy=false: markDelete only                   (1-step)
+        performs bulk API calls.  PYTHON content-type templates (e.g.
+        ``switch_freeform``) use direct DELETE; everything else uses the
+        normal markDelete → pushConfig → remove flow.
+
+            - deploy=true:  markDelete → pushConfig → remove (3-step)
+            - deploy=false: markDelete only                  (1-step)
+            - PYTHON-type:  direct DELETE (1-step, regardless of deploy)
         """
         self.log.debug("ENTER: _execute_deleted()")
         self.log.debug(f"Processing {len(diff_results)} delete entries")
@@ -1601,6 +1752,9 @@ class NDPolicyModule:
         # Phase A: Register per-entry results and collect all policy IDs
         all_policy_ids_to_delete = []
         all_switch_ids = []
+        # Map policy ID → templateName so Phase B can route switch_freeform
+        # policies through a direct DELETE instead of markDelete.
+        policy_template_map: Dict[str, str] = {}
 
         for diff_entry in diff_results:
             action = diff_entry["action"]
@@ -1620,6 +1774,7 @@ class NDPolicyModule:
             # --- FAIL ---
             if action == "fail":
                 self.log.warning(f"Delete failed: {error_msg}")
+                self._proposed.append(want)
                 self._register_result(
                     action="policy_deleted",
                     state="deleted",
@@ -1638,6 +1793,7 @@ class NDPolicyModule:
                     f"Policy not found for deletion: "
                     f"{want.get('templateName', want.get('policyId', 'switch-only'))}"
                 )
+                self._proposed.append(want)
                 self._register_result(
                     action="policy_deleted",
                     state="deleted",
@@ -1653,11 +1809,20 @@ class NDPolicyModule:
             # --- DELETE / DELETE_ALL ---
             if action in ("delete", "delete_all"):
                 self.log.info(
-                    f"Marking {len(policy_ids)} policy(ies) for deletion: {policy_ids}"
+                    f"Collecting {len(policy_ids)} policy(ies) for deletion: {policy_ids}"
                 )
+                self._proposed.append(want)
+                self._before.extend(policies)  # what existed before deletion
                 all_policy_ids_to_delete.extend(policy_ids)
 
-                # Collect switch IDs for shadow cleanup later
+                # Track templateName per policy for direct-delete routing
+                for p in policies:
+                    pid = p.get("policyId", "")
+                    tname = p.get("templateName", "")
+                    if pid:
+                        policy_template_map[pid] = tname
+
+                # Collect switch IDs for result tracking
                 for p in policies:
                     sw = p.get("switchId", "")
                     if sw and sw not in all_switch_ids:
@@ -1723,66 +1888,306 @@ class NDPolicyModule:
             f"(deduplicated from {len(all_policy_ids_to_delete)})"
         )
 
-        # Step 1: markDelete — always flag policies for deletion
+        # ---------------------------------------------------------------------
+        # Split policies into two buckets:
+        #
+        # 1. PYTHON content-type templates (e.g. switch_freeform):
+        #    markDelete FAILS for these ("Policies with content type PYTHON
+        #    or without generated config can't be mark deleted").
+        #    Use direct DELETE /policies/{policyId} instead.
+        #    NDFC may leave a ghost switch_freeform_config (markDeleted,
+        #    negative priority) which gets cleaned up on next
+        #    deploy/recalculate — no explicit cleanup needed.
+        #    This matches the dcnm_policy approach (line 1149).
+        #
+        # 2. Everything else (TEMPLATE_CLI, e.g. feature_enable):
+        #    Normal markDelete → pushConfig → remove flow.
+        # ---------------------------------------------------------------------
+        DIRECT_DELETE_TEMPLATES = {"switch_freeform"}
+
+        direct_delete_ids = [
+            pid for pid in unique_policy_ids
+            if policy_template_map.get(pid, "") in DIRECT_DELETE_TEMPLATES
+        ]
+        normal_delete_ids = [
+            pid for pid in unique_policy_ids
+            if pid not in set(direct_delete_ids)
+        ]
+
         self.log.info(
-            f"{'Step 1/4' if self.deploy else 'Step 1/1'}: "
-            f"markDelete for {len(unique_policy_ids)} policies"
+            f"Delete routing: {len(direct_delete_ids)} direct-DELETE "
+            f"(PYTHON-type), {len(normal_delete_ids)} markDelete flow"
         )
-        self._api_mark_delete(unique_policy_ids)
 
-        self.results.action = "policy_mark_delete"
-        self.results.state = "deleted"
-        self.results.check_mode = self.check_mode
-        self.results.operation_type = OperationType.DELETE
-        self.results.response_current = self.nd.rest_send.response_current
-        self.results.result_current = self.nd.rest_send.result_current
-        self.results.diff_current = {
-            "action": "mark_delete",
-            "policy_ids": unique_policy_ids,
-        }
-        self.results.register_task_result()
+        # ----- Direct DELETE for PYTHON-type policies -----
+        if direct_delete_ids:
+            self.log.info(
+                f"Direct-deleting {len(direct_delete_ids)} PYTHON-type "
+                f"policies: {direct_delete_ids}"
+            )
+            deleted_direct = []
+            failed_direct = []
+            for pid in direct_delete_ids:
+                try:
+                    self._api_delete_policy(pid)
+                    deleted_direct.append(pid)
+                except Exception:  # noqa: BLE001
+                    self.log.error(f"Direct DELETE failed for {pid}")
+                    failed_direct.append(pid)
 
-        # Step 2 (deploy=true only): pushConfig — push negation config to switches
+            if deleted_direct:
+                msg = (
+                    f"Directly deleted {len(deleted_direct)} "
+                    f"switch_freeform policy(ies). "
+                    "Note: NDFC may leave a residual "
+                    "switch_freeform_config policy in markDeleted "
+                    "state which is cleaned up automatically on "
+                    "the next deploy or recalculate cycle."
+                )
+                if self.deploy:
+                    msg += (
+                        " deploy=true was requested but does not "
+                        "apply to switch_freeform — these policies "
+                        "are removed via direct DELETE without "
+                        "pushConfig."
+                    )
+                self._register_result(
+                    action="policy_direct_delete",
+                    state="deleted",
+                    operation_type=OperationType.DELETE,
+                    return_code=200,
+                    message=msg,
+                    success=True,
+                    found=True,
+                    diff={
+                        "action": "direct_delete",
+                        "policy_ids": deleted_direct,
+                        "template": "switch_freeform",
+                    },
+                )
+            if failed_direct:
+                self._register_result(
+                    action="policy_direct_delete",
+                    state="deleted",
+                    operation_type=OperationType.DELETE,
+                    return_code=-1,
+                    message=(
+                        f"Direct DELETE failed for {len(failed_direct)} "
+                        f"policy(ies): {failed_direct}"
+                    ),
+                    success=False,
+                    found=True,
+                    diff={
+                        "action": "direct_delete_failed",
+                        "policy_ids": failed_direct,
+                    },
+                )
+
+        # ----- Normal markDelete → pushConfig → remove for the rest -----
+        if not normal_delete_ids:
+            self.log.info(
+                "No TEMPLATE_CLI policies to process through "
+                "markDelete flow — done"
+            )
+            self.log.debug("EXIT: _execute_deleted()")
+            return
+
+        # Step 1: markDelete
+        self.log.info(
+            f"{'Step 1/3' if self.deploy else 'Step 1/1'}: "
+            f"markDelete for {len(normal_delete_ids)} policies"
+        )
+        self._api_mark_delete(normal_delete_ids)
+
+        self._register_result(
+            action="policy_mark_delete",
+            state="deleted",
+            operation_type=OperationType.DELETE,
+            return_code=200,
+            message=f"Marked {len(normal_delete_ids)} policies for deletion",
+            success=True,
+            found=True,
+            diff={
+                "action": "mark_delete",
+                "policy_ids": normal_delete_ids,
+            },
+        )
+
+        # Step 2 (deploy=true only): pushConfig
+        deploy_success = True
         if self.deploy:
-            self.log.info(f"Step 2/4: pushConfig for {len(unique_policy_ids)} policies")
-            self._deploy_policies(unique_policy_ids, state="deleted")
+            self.log.info(
+                f"Step 2/3: pushConfig for {len(normal_delete_ids)} policies"
+            )
+            deploy_success = self._deploy_policies(
+                normal_delete_ids, state="deleted"
+            )
 
         # deploy=false legacy behavior: stop after markDelete
         if not self.deploy:
             self.log.info(
-                "Deploy=false: skipping pushConfig/remove; policies remain marked for deletion"
+                "Deploy=false: skipping pushConfig/remove; "
+                "policies remain marked for deletion"
+            )
+            self.log.debug("EXIT: _execute_deleted()")
+            return
+
+        # If pushConfig failed, do NOT proceed to remove.
+        if not deploy_success:
+            self.log.error(
+                "pushConfig failed — aborting remove. "
+                "Policies remain in markDeleted state."
+            )
+            self._register_result(
+                action="policy_deploy_abort",
+                state="deleted",
+                operation_type=OperationType.DELETE,
+                return_code=-1,
+                message=(
+                    "pushConfig failed for one or more policies. "
+                    "Aborting remove — policies remain marked for deletion "
+                    "with negative priority. Fix device connectivity and re-run."
+                ),
+                success=False,
+                found=True,
+                diff={
+                    "action": "deploy_abort",
+                    "policy_ids": normal_delete_ids,
+                    "reason": "pushConfig per-policy failure",
+                },
             )
             self.log.debug("EXIT: _execute_deleted()")
             return
 
         # Step 3: remove — hard-delete policy records from NDFC
         self.log.info(
-            "Step 3/4: "
-            f"remove {len(unique_policy_ids)} policies"
+            f"Step 3/3: remove {len(normal_delete_ids)} policies"
         )
-        self._api_remove_policies(unique_policy_ids)
+        self._api_remove_policies(normal_delete_ids)
 
-        self.results.action = "policy_remove"
-        self.results.state = "deleted"
-        self.results.check_mode = self.check_mode
-        self.results.operation_type = OperationType.DELETE
-        self.results.response_current = self.nd.rest_send.response_current
-        self.results.result_current = self.nd.rest_send.result_current
-        self.results.diff_current = {
-            "action": "remove",
-            "policy_ids": unique_policy_ids,
-        }
-        self.results.register_task_result()
-
-        # Step 4: cleanup shadow/companion policies
-        # NDFC creates companion ``switch_freeform_config`` policies for
-        # ``switch_freeform`` templates.  The bulk remove only deletes the
-        # parent; the shadows remain with markDeleted=True and negative
-        # priority.  Clean them up via individual DELETE calls.
-        self.log.info("Step 4/4: shadow policy cleanup")
-        self._cleanup_shadow_policies(unique_policy_ids, all_switch_ids)
+        self._register_result(
+            action="policy_remove",
+            state="deleted",
+            operation_type=OperationType.DELETE,
+            return_code=200,
+            message=f"Removed {len(normal_delete_ids)} policies",
+            success=True,
+            found=True,
+            diff={
+                "action": "remove",
+                "policy_ids": normal_delete_ids,
+            },
+        )
 
         self.log.debug("EXIT: _execute_deleted()")
+
+    # =========================================================================
+    # Cleanup: Stale markDeleted policies
+    # =========================================================================
+
+    def _cleanup_stale_mark_deleted(self, diff_results: List[Dict]) -> None:
+        """Remove stale markDeleted policies that conflict with newly created/updated ones.
+
+        When a previous ``state=deleted`` run's ``pushConfig`` fails (e.g.,
+        device unreachable), policies remain on the controller in a
+        ``markDeleted=True`` state with negative priority.  If the user
+        subsequently runs ``state=merged`` to recreate the same policy,
+        the markDeleted remnant still exists and may conflict when the
+        switch becomes reachable again.
+
+        This method queries each affected switch for markDeleted policies
+        matching the same ``templateName`` (and ``description`` when
+        ``use_desc_as_key=true``) and removes them via direct DELETE.
+
+        Only called after ``_execute_merged()`` completes and only for
+        entries where the action was ``create``, ``update``, or
+        ``delete_and_create``.
+        """
+        self.log.debug("ENTER: _cleanup_stale_mark_deleted()")
+
+        # Collect unique (switchId, templateName, description) tuples from
+        # entries that actually mutated state.
+        mutation_actions = {"create", "update", "delete_and_create"}
+        lookup_keys = set()
+        for diff_entry in diff_results:
+            if diff_entry.get("action") not in mutation_actions:
+                continue
+            want = diff_entry.get("want", {})
+            switch_id = want.get("switchId")
+            template_name = want.get("templateName")
+            description = want.get("description", "")
+            if switch_id and template_name:
+                lookup_keys.add((switch_id, template_name, description))
+
+        if not lookup_keys:
+            self.log.debug("No mutations to check for stale markDeleted policies")
+            return
+
+        self.log.info(
+            f"Checking {len(lookup_keys)} switch+template combinations "
+            "for stale markDeleted policies"
+        )
+
+        stale_ids = []
+        for switch_id, template_name, description in lookup_keys:
+            lucene = self._build_lucene_filter(
+                switchId=switch_id,
+                templateName=template_name,
+            )
+            try:
+                all_policies = self._query_policies_raw(lucene)
+            except Exception:  # noqa: BLE001
+                self.log.warning(
+                    f"Failed to query for stale markDeleted policies on "
+                    f"switch {switch_id}, template {template_name}. Skipping."
+                )
+                continue
+
+            for p in all_policies:
+                if not p.get("markDeleted", False):
+                    continue
+                # When use_desc_as_key is true, only clean up if description matches
+                if self.use_desc_as_key and description:
+                    if (p.get("description", "") or "") != description:
+                        continue
+                pid = p.get("policyId")
+                if pid:
+                    stale_ids.append(pid)
+
+        if not stale_ids:
+            self.log.info("No stale markDeleted policies found")
+            self.log.debug("EXIT: _cleanup_stale_mark_deleted()")
+            return
+
+        # Deduplicate
+        stale_ids = list(dict.fromkeys(stale_ids))
+        self.log.info(
+            f"Found {len(stale_ids)} stale markDeleted policies to clean up: {stale_ids}"
+        )
+
+        deleted = []
+        for pid in stale_ids:
+            try:
+                self._api_delete_policy(pid)
+                deleted.append(pid)
+            except Exception:  # noqa: BLE001
+                self.log.warning(f"Failed to delete stale policy {pid}, skipping")
+
+        if deleted:
+            self._register_result(
+                action="policy_stale_cleanup",
+                operation_type=OperationType.DELETE,
+                return_code=200,
+                message=f"Cleaned up {len(deleted)} stale markDeleted policies",
+                success=True,
+                found=True,
+                diff={
+                    "action": "stale_mark_deleted_cleanup",
+                    "cleaned_policy_ids": deleted,
+                },
+            )
+
+        self.log.debug("EXIT: _cleanup_stale_mark_deleted()")
 
     # =========================================================================
     # Deploy: pushConfig
@@ -1792,16 +2197,23 @@ class NDPolicyModule:
         self,
         policy_ids: List[str],
         state: str = "merged",
-    ) -> None:
+    ) -> bool:
         """Deploy policies by calling pushConfig.
+
+        Inspects the 207 Multi-Status response body for per-policy
+        failures (e.g., device connectivity issues).  If any policy
+        has ``status: "failed"``, the deploy is considered failed.
 
         Args:
             policy_ids: List of policy IDs to deploy.
             state: Module state for result reporting.
+
+        Returns:
+            True if all policies deployed successfully, False if any failed.
         """
         if not policy_ids:
             self.log.debug("No policy IDs to deploy, skipping")
-            return
+            return True
 
         self.log.info(f"Deploying {len(policy_ids)} policies via pushConfig")
 
@@ -1823,7 +2235,7 @@ class NDPolicyModule:
                 "policy_ids": policy_ids,
             }
             self.results.register_task_result()
-            return
+            return True
 
         push_body = PolicyIds(policy_ids=policy_ids)
 
@@ -1833,15 +2245,38 @@ class NDPolicyModule:
             ep.endpoint_params.cluster_name = self.cluster_name
         # NOTE: pushConfig does NOT accept ticketId per manage.json spec
 
-        self.nd.request(ep.path, ep.verb, push_body.to_request_dict())
+        data = self.nd.request(ep.path, ep.verb, push_body.to_request_dict())
+
+        # Inspect 207 body for per-policy failures
+        failed_policies = []
+        if isinstance(data, dict):
+            for p in data.get("policies", []):
+                if p.get("status") == "failed":
+                    failed_policies.append(p)
+
+        deploy_success = len(failed_policies) == 0
+
+        if failed_policies:
+            failed_msgs = [f"{p.get('policyId', '?')}: {p.get('message', 'unknown error')}" for p in failed_policies]
+            self.log.error(
+                f"pushConfig failed for {len(failed_policies)} policy(ies): "
+                + "; ".join(failed_msgs)
+            )
 
         self.results.response_current = self.nd.rest_send.response_current
-        self.results.result_current = self.nd.rest_send.result_current
+        self.results.result_current = {
+            "success": deploy_success,
+            "found": True,
+            "changed": deploy_success,
+        }
         self.results.diff_current = {
             "action": "deploy",
             "policy_ids": policy_ids,
+            "deploy_success": deploy_success,
+            "failed_policies": [p.get("policyId") for p in failed_policies],
         }
         self.results.register_task_result()
+        return deploy_success
 
     # =========================================================================
     # API Helpers (low-level CRUD)
@@ -1992,8 +2427,9 @@ class NDPolicyModule:
     def _api_delete_policy(self, policy_id: str) -> None:
         """Delete a single policy via DELETE /policies/{policyId}.
 
-        This is used to clean up shadow/companion ``switch_freeform_config``
-        policies that are not removed by the bulk ``remove`` action.
+        Used for PYTHON content-type templates (e.g. ``switch_freeform``)
+        that cannot go through the markDelete flow, and for cleaning up
+        stale markDeleted policies.
 
         Args:
             policy_id: Policy ID to delete (e.g., "POLICY-12345").
@@ -2009,120 +2445,6 @@ class NDPolicyModule:
             ep.endpoint_params.ticket_id = self.ticket_id
 
         self.nd.request(ep.path, ep.verb)
-
-    def _cleanup_shadow_policies(
-        self, parent_policy_ids: List[str], switch_ids: List[str]
-    ) -> None:
-        """Remove shadow/companion policies left behind after bulk remove.
-
-        ## Background — ``switch_freeform`` shadow policies
-
-        NDFC treats the ``switch_freeform`` template specially because it is
-        a **PYTHON content-type** template.  When you create a
-        ``switch_freeform`` policy, NDFC automatically creates a companion
-        ``switch_freeform_config`` (TEMPLATE_CLI content-type) policy that
-        holds the actual generated CLI config.
-
-        The companion has:
-
-        - ``source`` = parent ``switch_freeform`` policy ID
-        - ``templateName`` = ``switch_freeform_config``
-        - Same ``description``, ``switchId``, ``priority`` as the parent
-
-        During deletion:
-
-        1. ``markDelete`` **fails** for the PYTHON parent ("Policies with
-           content type PYTHON or without generated config can't be mark
-           deleted") but **succeeds** for the TEMPLATE_CLI companion
-           (negates priority, sets ``markDeleted=True``).
-        2. ``pushConfig`` deploys the negation config from the companion.
-        3. ``remove`` deletes the **parent** but leaves the **companion**
-           behind as a stale record.
-
-        This method queries each affected switch for policies whose
-        ``source`` matches a removed parent and deletes them individually
-        via ``DELETE /policies/{policyId}``.
-
-        This is the equivalent of the legacy ``dcnm_policy`` workaround
-        that uses a direct ``DELETE`` instead of ``markDelete`` for
-        ``switch_freeform`` templates.
-
-        Note: This behavior is specific to ``switch_freeform`` — other
-        templates (e.g., ``feature_enable``) are TEMPLATE_CLI content-type
-        and do not produce companion policies.
-
-        Args:
-            parent_policy_ids: List of parent policy IDs that were just removed.
-            switch_ids: List of switch serial numbers that had policies deleted.
-        """
-        if not parent_policy_ids or not switch_ids:
-            self.log.info("No shadow policies to clean up (no parents or switches)")
-            return
-
-        parent_set = set(parent_policy_ids)
-        unique_switches = list(dict.fromkeys(switch_ids))
-
-        # Query each switch for ALL policies (unfiltered — including
-        # markDeleted and source != "") to find stale companions.
-        shadow_ids = []
-        for switch_id in unique_switches:
-            ep = EpManagePoliciesGet()
-            ep.fabric_name = self.fabric_name
-            if self.cluster_name:
-                ep.endpoint_params.cluster_name = self.cluster_name
-            ep.lucene_params.filter = f"switchId:{switch_id}"
-            ep.lucene_params.max = 10000
-
-            try:
-                data = self.nd.request(ep.path, ep.verb)
-            except Exception:  # noqa: BLE001
-                self.log.warning(
-                    f"Failed to query policies for switch {switch_id} "
-                    "during shadow cleanup, skipping"
-                )
-                continue
-
-            all_policies = data.get("policies", []) if isinstance(data, dict) else []
-            for p in all_policies:
-                if p.get("source", "") in parent_set:
-                    shadow_ids.append(p["policyId"])
-
-        if not shadow_ids:
-            self.log.info("No shadow policies found — nothing to clean up")
-            return
-
-        self.log.info(
-            f"Found {len(shadow_ids)} shadow policies to clean up: {shadow_ids}"
-        )
-
-        # Delete each shadow individually via DELETE /policies/{policyId}
-        deleted = []
-        for shadow_id in shadow_ids:
-            try:
-                self._api_delete_policy(shadow_id)
-                deleted.append(shadow_id)
-            except Exception:  # noqa: BLE001
-                self.log.warning(
-                    f"Failed to delete shadow policy {shadow_id}, skipping"
-                )
-
-        if deleted:
-            self.results.action = "policy_shadow_cleanup"
-            self.results.state = "deleted"
-            self.results.check_mode = self.check_mode
-            self.results.operation_type = OperationType.DELETE
-            self.results.response_current = {
-                "RETURN_CODE": 200,
-                "MESSAGE": f"Cleaned up {len(deleted)} shadow policies",
-                "DATA": {"shadow_policy_ids": deleted},
-            }
-            self.results.result_current = {"success": True, "changed": True}
-            self.results.diff_current = {
-                "action": "shadow_cleanup",
-                "shadow_policy_ids": deleted,
-                "parent_policy_ids": parent_policy_ids,
-            }
-            self.results.register_task_result()
 
     # =========================================================================
     # Results Helper
