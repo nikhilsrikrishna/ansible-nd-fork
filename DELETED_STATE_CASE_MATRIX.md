@@ -6,15 +6,24 @@ The deleted state marks and/or removes policies on NDFC depending on `deploy`. I
 policy is a no-op (`changed=false`). The module supports two deletion flows depending on
 the `deploy` parameter:
 
-| `deploy` | Flow | Steps | Effect |
-|----------|------|-------|--------|
-| `true` (default) | **4-step** | markDelete → pushConfig → remove → companion cleanup | Negation config pushed to switch, policy record deleted from NDFC, companion policies cleaned up |
-| `false` | **1-step** | markDelete only | Policy record is flagged for deletion on NDFC; no pushConfig, no hard-delete |
+| `deploy` | Template Type | Flow | Steps | Effect |
+|----------|---------------|------|-------|--------|
+| `true` (default) | Normal (e.g. `feature_enable`) | **3-step** | markDelete → pushConfig → remove | Negation config pushed to switch, policy record deleted from NDFC |
+| `true` (default) | `switch_freeform` | **1-step direct DELETE** | `DELETE /policies/{id}` | Policy hard-deleted immediately; `deploy` has no effect |
+| `false` | Normal (e.g. `feature_enable`) | **1-step** | markDelete only | Policy record is flagged for deletion on NDFC; no pushConfig, no hard-delete |
+| `false` | `switch_freeform` | **1-step direct DELETE** | `DELETE /policies/{id}` | Same as `deploy=true` — `deploy` flag is ignored for `switch_freeform` |
 
-> **Bulk execution**: All policy IDs to delete are collected first, then executed in bulk
-> (not per-entry). With `deploy=true`, markDelete, pushConfig, and remove each happen once
-> for all policies, followed by companion policy cleanup. With `deploy=false`, only markDelete
-> runs once for all policies.
+> **Bulk execution**: All policy IDs to delete are collected first, then split into two
+> buckets: `switch_freeform` policies use direct `DELETE /policies/{id}` (one call per
+> policy), while all other policies go through the normal bulk flow. With `deploy=true`,
+> markDelete, pushConfig, and remove each happen once for the normal-flow policies. With
+> `deploy=false`, only markDelete runs.
+>
+> **switch_freeform note**: NDFC rejects `markDelete` for PYTHON content-type policies
+> ("Policies with content type PYTHON or without generated config can't be mark deleted").
+> The module uses direct `DELETE /policies/{id}` instead, matching `dcnm_policy` behavior.
+> NDFC may leave a residual `switch_freeform_config` ghost policy in `markDeleted` state,
+> which is cleaned up automatically on the next deploy or recalculate cycle.
 
 ---
 
@@ -113,8 +122,8 @@ _Lookup: Case A — direct GET by policy ID. `use_desc_as_key` and `description`
 
 | Case | name | use_desc_as_key | description | Controller State | action | found | changed | Execution | Notes |
 |------|------|-----------------|-------------|-----------------|--------|-------|---------|-----------|-------|
-| **D-1** | `POLICY-1234` | `false` | _any_ | Policy exists | `delete` | ✅ | ✅ | 4-step or markDelete-only per `deploy` | Exact single policy deleted |
-| **D-1a** | `POLICY-1234` | `true` | _any_ | Policy exists | `delete` | ✅ | ✅ | 4-step or markDelete-only per `deploy` | `use_desc_as_key` irrelevant for ID lookup |
+| **D-1** | `POLICY-1234` | `false` | _any_ | Policy exists | `delete` | ✅ | ✅ | Per `deploy` and template type (see overview) | Exact single policy deleted |
+| **D-1a** | `POLICY-1234` | `true` | _any_ | Policy exists | `delete` | ✅ | ✅ | Per `deploy` and template type (see overview) | `use_desc_as_key` irrelevant for ID lookup |
 | **D-2** | `POLICY-9999` | `false` | _any_ | Policy absent (404) | `skip` | ❌ | ❌ | No API calls | **Idempotent** — already absent, no error |
 | **D-2a** | `POLICY-9999` | `true` | _any_ | Policy absent | `skip` | ❌ | ❌ | No API calls | Same — ID lookup ignores desc_as_key |
 | **D-2b** | `POLICY-1234` | _any_ | _any_ | `markDeleted=true` | `skip` | ❌ | ❌ | No API calls | Treated as absent — pending deletion by another process |
@@ -216,23 +225,26 @@ Phase A: Compute diffs (per config entry)
 Phase B: Bulk execution (all collected policy IDs at once)
 │  ├── Deduplicate policy IDs (same policy could match multiple entries)
 │  │
-│  ├── Step 1: POST /policyActions/markDelete
-│  │   └── Flags policies for deletion on controller
-│  │   └── Result registered: action="mark_delete"
+│  ├── Split into two buckets by template type:
 │  │
-│  ├── Step 2: POST /policyActions/pushConfig
-│  │   └── Pushes negation config to switches (removes running config)
-│  │   └── Result registered: action="deploy"
+│  ├── Bucket 1: switch_freeform (PYTHON content-type)
+│  │   └── For each policy: DELETE /policies/{policyId}
+│  │   └── deploy flag is ignored — always direct DELETE
+│  │   └── Result registered: action="policy_direct_delete"
+│  │   └── NDFC may leave a ghost switch_freeform_config (auto-cleaned)
 │  │
-│  ├── Step 3: POST /policyActions/remove
-│  │   └── Hard-deletes policy records from NDFC database
-│  │   └── Result registered: action="remove"
-│  │
-│  └── Step 4: Companion policy cleanup
-│      └── Queries each affected switch for policies whose `source` matches a removed parent ID
-│      └── Deletes each companion via DELETE /policies/{policyId}
-│      └── Result registered: action="policy_shadow_cleanup"
-│      └── Only applies to PYTHON content-type templates (e.g., switch_freeform)
+│  └── Bucket 2: Everything else (TEMPLATE_CLI, e.g. feature_enable)
+│      ├── Step 1: POST /policyActions/markDelete
+│      │   └── Flags policies for deletion on controller
+│      │   └── Result registered: action="mark_delete"
+│      │
+│      ├── Step 2: POST /policyActions/pushConfig
+│      │   └── Pushes negation config to switches (removes running config)
+│      │   └── Result registered: action="deploy"
+│      │
+│      └── Step 3: POST /policyActions/remove
+│          └── Hard-deletes policy records from NDFC database
+│          └── Result registered: action="remove"
 ```
 
 ### Normal Execution (deploy=false)
@@ -240,15 +252,22 @@ Phase B: Bulk execution (all collected policy IDs at once)
 ```
 Phase A: Same as above
 │
-Phase B: Bulk execution (simplified)
-│  └── Step 1: POST /policyActions/markDelete
-│      └── Flags policy records for deletion on controller
-│      └── No pushConfig, no remove; switch running config is NOT affected
+Phase B: Bulk execution
+│  ├── Split into two buckets by template type:
+│  │
+│  ├── Bucket 1: switch_freeform (PYTHON content-type)
+│  │   └── Same as deploy=true — direct DELETE (deploy flag ignored)
+│  │
+│  └── Bucket 2: Everything else
+│      └── Step 1: POST /policyActions/markDelete
+│          └── Flags policy records for deletion on controller
+│          └── No pushConfig, no remove; switch running config is NOT affected
 ```
 
-> **When to use `deploy=false`**: If you only want to clean up stale policy records from
-> NDFC without affecting the switches and without hard-deleting immediately (e.g., staged
-> cleanup workflows, deferred removal).
+> **When to use `deploy=false`**: If you only want to flag policy records for deletion on
+> NDFC without affecting switches or hard-deleting immediately (e.g., staged cleanup
+> workflows, deferred removal). Note: `deploy=false` has no effect on `switch_freeform`
+> policies — they always use direct DELETE regardless of the `deploy` setting.
 
 ---
 
@@ -266,8 +285,8 @@ config:
 ```
 
 The module collects `[POLICY-100, POLICY-200, POLICY-100]` and deduplicates to
-`[POLICY-100, POLICY-200]`. Only one markDelete/pushConfig/remove call is made for each
-unique policy ID.
+`[POLICY-100, POLICY-200]`. Only one API call is made for each unique policy ID
+(direct DELETE for `switch_freeform`, or markDelete/pushConfig/remove for everything else).
 
 ---
 
@@ -333,13 +352,17 @@ START: state=deleted, config entries received
 │
 │  BULK EXECUTION (if not check_mode AND policy_ids collected):
 │  ├── Deduplicate policy IDs
-│  ├── deploy=true?
-│  │   ├── Step 1: markDelete(policy_ids)     ← flag for deletion
-│  │   ├── Step 2: pushConfig(policy_ids)     ← remove config from switches
-│  │   ├── Step 3: remove(policy_ids)         ← hard-delete from NDFC
-│  │   └── Step 4: companion cleanup          ← delete companion policies for PYTHON templates
-│  └── deploy=false?
-│      └── Step 1: markDelete(policy_ids)     ← flag for deletion only
+│  ├── Split into two buckets:
+│  │   ├── switch_freeform (PYTHON-type) → direct DELETE /policies/{id}
+│  │   │   └── deploy flag is ignored — always direct DELETE
+│  │   │   └── NDFC may leave ghost switch_freeform_config (auto-cleaned)
+│  │   └── Everything else → normal flow:
+│  │       ├── deploy=true?
+│  │       │   ├── Step 1: markDelete(policy_ids)  ← flag for deletion
+│  │       │   ├── Step 2: pushConfig(policy_ids)  ← remove config from switches
+│  │       │   └── Step 3: remove(policy_ids)      ← hard-delete from NDFC
+│  │       └── deploy=false?
+│  │           └── Step 1: markDelete(policy_ids)  ← flag for deletion only
 │
 END: module.exit_json(changed=..., results=...)
 ```
@@ -421,7 +444,7 @@ Policies already flagged with `markDeleted=true` are **excluded** from `_build_h
 This prevents the module from trying to re-delete a policy that's already being removed
 by another process or a previous run.
 
-### 4. Source Filter (No Shadow Policy Deletion)
+### 4. Source Filter (No Companion Policy Deletion)
 
 Policies with `source != ""` are excluded from `_build_have` results during diff calculation.
 This prevents the module from treating NDFC-managed companion policies as user-managed entries.
@@ -436,10 +459,10 @@ a companion `switch_freeform_config` policy with:
 These companions are:
 - **Excluded** from `_build_have` results (source filter) — they are never treated as
   user-managed policies for diff/idempotency checks
-- **Cleaned up automatically** in Step 4 of the delete flow (`deploy=true`) — after the
-  parent is removed, the module queries affected switches for orphaned companions whose
-  `source` matches a removed parent ID and deletes them via `DELETE /policies/{policyId}`
-- **Not cleaned up** when `deploy=false` — only markDelete is performed, companions remain
+- **Not explicitly cleaned up by the module** — when the parent `switch_freeform` policy
+  is deleted via direct DELETE, NDFC may leave the companion in a `markDeleted` state.
+  This ghost policy is cleaned up automatically by NDFC on the next deploy or recalculate
+  cycle. This matches the `dcnm_policy` approach (no explicit companion cleanup).
 
 Other template content types (`TEMPLATE_CLI`, `TEXT`) do not create companion policies.
 
@@ -543,11 +566,12 @@ policy twice.
     state: deleted
     deploy: false
     config:
-      - name: switch_freeform
+      - name: feature_enable
       - switch:
           - serial_number: FDO29080NBU
     # → Policies are markDeleted on NDFC; no pushConfig/remove API call
     # → Switch running config is NOT changed
+    # Note: deploy=false has no effect on switch_freeform — always direct DELETE
 ```
 
 ### Check Mode: Preview Deletions
@@ -584,16 +608,20 @@ policy twice.
    - `_get_diff_deleted_single()` (D-12) — after query, before mutations
 
 5. **Bulk execution**: Individual config entries are processed for diff calculation, but the
-  actual API calls happen once in bulk for all collected policy IDs. For `deploy=true`,
-  markDelete + pushConfig + remove run once each, followed by companion policy cleanup;
-  for `deploy=false`, only markDelete runs.
+  actual API calls happen once in bulk for all collected policy IDs. Policy IDs are split
+  into two buckets: `switch_freeform` policies use direct DELETE (regardless of `deploy`),
+  while everything else goes through the normal flow (markDelete + pushConfig + remove for
+  `deploy=true`, markDelete only for `deploy=false`).
 
-6. **deploy=true vs deploy=false**:
+6. **deploy=true vs deploy=false** (for non-`switch_freeform` policies):
    - `deploy=true`: Config is removed from switches first (markDelete + pushConfig), then
-     records are deleted from NDFC (remove), and finally companion policies for PYTHON
-     content-type templates are cleaned up. This is the safe default.
+     records are deleted from NDFC (remove). This is the safe default.
    - `deploy=false`: Policies are only marked for deletion on NDFC (markDelete).
-     No pushConfig, no hard-delete, and no companion cleanup are performed in this run.
+     No pushConfig, no hard-delete.
+   - **`switch_freeform` exception**: The `deploy` flag is ignored. These policies always
+     use direct `DELETE /policies/{id}` because NDFC rejects `markDelete` for PYTHON
+     content-type policies. A warning is included in the result when `deploy=true` was
+     requested but had no effect.
 
 7. **Multi-switch expansion**: If the switch list has multiple switches, `_translate_config`
    expands each policy entry into one entry per switch. Each expanded entry goes through
