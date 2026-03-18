@@ -361,13 +361,6 @@ class NDPolicyModule:
         elif not self.deploy:
             self.log.info("Deploy not requested, skipping pushConfig")
 
-        # Phase 5: Clean up stale markDeleted policies that match the
-        # same switch+template (or switch+description) as policies we
-        # just created or updated.  These remnants are left behind when
-        # a previous delete's pushConfig failed (device unreachable).
-        if not self.check_mode:
-            self._cleanup_stale_mark_deleted(diff_results)
-
         self.log.debug("EXIT: _handle_merged_state()")
 
     def _handle_query_state(self) -> None:
@@ -2080,114 +2073,6 @@ class NDPolicyModule:
         )
 
         self.log.debug("EXIT: _execute_deleted()")
-
-    # =========================================================================
-    # Cleanup: Stale markDeleted policies
-    # =========================================================================
-
-    def _cleanup_stale_mark_deleted(self, diff_results: List[Dict]) -> None:
-        """Remove stale markDeleted policies that conflict with newly created/updated ones.
-
-        When a previous ``state=deleted`` run's ``pushConfig`` fails (e.g.,
-        device unreachable), policies remain on the controller in a
-        ``markDeleted=True`` state with negative priority.  If the user
-        subsequently runs ``state=merged`` to recreate the same policy,
-        the markDeleted remnant still exists and may conflict when the
-        switch becomes reachable again.
-
-        This method queries each affected switch for markDeleted policies
-        matching the same ``templateName`` (and ``description`` when
-        ``use_desc_as_key=true``) and removes them via direct DELETE.
-
-        Only called after ``_execute_merged()`` completes and only for
-        entries where the action was ``create``, ``update``, or
-        ``delete_and_create``.
-        """
-        self.log.debug("ENTER: _cleanup_stale_mark_deleted()")
-
-        # Collect unique (switchId, templateName, description) tuples from
-        # entries that actually mutated state.
-        mutation_actions = {"create", "update", "delete_and_create"}
-        lookup_keys = set()
-        for diff_entry in diff_results:
-            if diff_entry.get("action") not in mutation_actions:
-                continue
-            want = diff_entry.get("want", {})
-            switch_id = want.get("switchId")
-            template_name = want.get("templateName")
-            description = want.get("description", "")
-            if switch_id and template_name:
-                lookup_keys.add((switch_id, template_name, description))
-
-        if not lookup_keys:
-            self.log.debug("No mutations to check for stale markDeleted policies")
-            return
-
-        self.log.info(
-            f"Checking {len(lookup_keys)} switch+template combinations "
-            "for stale markDeleted policies"
-        )
-
-        stale_ids = []
-        for switch_id, template_name, description in lookup_keys:
-            lucene = self._build_lucene_filter(
-                switchId=switch_id,
-                templateName=template_name,
-            )
-            try:
-                all_policies = self._query_policies_raw(lucene)
-            except Exception:  # noqa: BLE001
-                self.log.warning(
-                    f"Failed to query for stale markDeleted policies on "
-                    f"switch {switch_id}, template {template_name}. Skipping."
-                )
-                continue
-
-            for p in all_policies:
-                if not p.get("markDeleted", False):
-                    continue
-                # When use_desc_as_key is true, only clean up if description matches
-                if self.use_desc_as_key and description:
-                    if (p.get("description", "") or "") != description:
-                        continue
-                pid = p.get("policyId")
-                if pid:
-                    stale_ids.append(pid)
-
-        if not stale_ids:
-            self.log.info("No stale markDeleted policies found")
-            self.log.debug("EXIT: _cleanup_stale_mark_deleted()")
-            return
-
-        # Deduplicate
-        stale_ids = list(dict.fromkeys(stale_ids))
-        self.log.info(
-            f"Found {len(stale_ids)} stale markDeleted policies to clean up: {stale_ids}"
-        )
-
-        deleted = []
-        for pid in stale_ids:
-            try:
-                self._api_delete_policy(pid)
-                deleted.append(pid)
-            except Exception:  # noqa: BLE001
-                self.log.warning(f"Failed to delete stale policy {pid}, skipping")
-
-        if deleted:
-            self._register_result(
-                action="policy_stale_cleanup",
-                operation_type=OperationType.DELETE,
-                return_code=200,
-                message=f"Cleaned up {len(deleted)} stale markDeleted policies",
-                success=True,
-                found=True,
-                diff={
-                    "action": "stale_mark_deleted_cleanup",
-                    "cleaned_policy_ids": deleted,
-                },
-            )
-
-        self.log.debug("EXIT: _cleanup_stale_mark_deleted()")
 
     # =========================================================================
     # Deploy: pushConfig

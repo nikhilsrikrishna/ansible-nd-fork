@@ -236,11 +236,6 @@ notes:
   deleted and a new one is created.
 - C(switch_freeform) policies do not support the C(markDelete) API. They are always
   removed via a direct C(DELETE) API call, regardless of the O(deploy) setting.
-- If C(pushConfig) fails during a C(deleted) operation (e.g., switch unreachable), the
-  module aborts before the final C(remove) step. Policies remain in a C(markDeleted) state
-  with negative priority. Re-run the task after fixing connectivity to complete the deletion.
-  If a C(merged) task is run while stale C(markDeleted) policies exist, the module
-  automatically cleans them up.
 """
 
 EXAMPLES = r"""
