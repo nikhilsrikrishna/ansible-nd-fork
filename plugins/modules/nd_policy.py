@@ -120,7 +120,7 @@ options:
             description:
             - Serial number of the target switch (e.g., C(FDO25031SY4)).
             - The alias C(ip) is kept for backward compatibility and may be a
-              switch management IP or hostname. The module resolves that value
+              switch management IP. The module resolves that value
               to the switch serial number before calling policy APIs.
             type: str
             required: true

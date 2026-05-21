@@ -27,6 +27,7 @@ from __future__ import annotations
 import copy
 import logging
 import re
+import time
 from typing import Any, ClassVar
 
 from ansible_collections.cisco.nd.plugins.module_utils.common.pydantic_compat import (
@@ -51,15 +52,19 @@ from ansible_collections.cisco.nd.plugins.module_utils.endpoints.v1.manage.manag
 from ansible_collections.cisco.nd.plugins.module_utils.endpoints.v1.manage.manage_fabrics_switch_actions import (
     EpManageSwitchActionsDeployPost,
 )
-from ansible_collections.cisco.nd.plugins.module_utils.enums import (
-    HttpVerbEnum,
-    OperationType,
+from ansible_collections.cisco.nd.plugins.module_utils.constants import SYSTEM_INJECTED_TEMPLATE_KEYS
+from ansible_collections.cisco.nd.plugins.module_utils.enums import HttpVerbEnum, OperationType
+from ansible_collections.cisco.nd.plugins.module_utils.fabric_inventory import (
+    FabricSwitchInventory,
 )
 from ansible_collections.cisco.nd.plugins.module_utils.models.manage_policies.config_models import (
     PlaybookPolicyConfig,
 )
 from ansible_collections.cisco.nd.plugins.module_utils.models.manage_policies.gathered_models import (
     GatheredPolicy,
+)
+from ansible_collections.cisco.nd.plugins.module_utils.models.manage_switches.switch_data_models import (
+    SwitchDataModel,
 )
 from ansible_collections.cisco.nd.plugins.module_utils.models.manage_policies.policy_actions import (
     PolicyIds,
@@ -79,6 +84,7 @@ from ansible_collections.cisco.nd.plugins.module_utils.nd_v2 import (
     NDModule,
     NDModuleError,
 )
+from ansible_collections.cisco.nd.plugins.module_utils.perf_timer import PerfTimer
 from ansible_collections.cisco.nd.plugins.module_utils.rest.results import Results
 
 # pylint: disable=logging-fstring-interpolation
@@ -95,40 +101,22 @@ from ansible_collections.cisco.nd.plugins.module_utils.rest.results import Resul
 def _looks_like_ip(value):
     """Return True if *value* looks like a dotted-quad IPv4 address.
 
+    Used to decide whether a switch identifier from the playbook needs
+    fabric-inventory resolution (IP → serial) or is already a serial
+    number that can be passed through unchanged.
+
     Args:
-        value: String to check.
+        value: Identifier string (or anything coercible to ``str``).
 
     Returns:
         True if the value matches a dotted-quad IPv4 pattern, False otherwise.
     """
-    parts = value.split(".")
-    if len(parts) == 4:
-        return all(p.isdigit() and 0 <= int(p) <= 255 for p in parts)
-    return False
-
-
-def _needs_resolution(value):
-    """Return True if the switch identifier needs IP/hostname → serial resolution.
-
-    Serial numbers are alphanumeric strings (e.g. ``FDO25031SY4``).
-    IPs look like dotted quads.  Hostnames contain dots or look like FQDNs.
-    If the value is already a serial number we can skip the fabric API call.
-
-    Args:
-        value: Switch identifier string to inspect.
-
-    Returns:
-        True if the value looks like an IP or hostname, False if it
-        appears to be a serial number already.
-    """
     if not value:
         return False
-    v = str(value).strip()
-    if _looks_like_ip(v):
-        return True
-    if "." in v:
-        return True
-    return False
+    parts = str(value).strip().split(".")
+    if len(parts) != 4:
+        return False
+    return all(p.isdigit() and 0 <= int(p) <= 255 for p in parts)
 
 
 class NDPolicyModule:
@@ -217,7 +205,60 @@ class NDPolicyModule:
         self._call_verb: HttpVerbEnum | None = None
         self._call_payload: dict | None = None
 
+        # Policy cache populated by _prefetch_all_policies() at the start of
+        # _handle_merged_state / _handle_deleted_state.  When populated,
+        # _build_have() filters from this cache (O(N) in-memory) instead of
+        # making per-entry HTTP GETs.  None means cache is not loaded
+        # (e.g. gathered state, or before prefetch).
+        self._policies_cache: list[dict] | None = None
+        self._policies_by_id_cache: dict[str, dict] = {}
+        self._policies_by_switch_cache: dict[str, list[dict]] = {}
+        # Composite (switchId, templateName) index for O(1) Case B/C lookups.
+        self._policies_by_switch_template_cache: dict[tuple[str, str], list[dict]] = {}
+
+        # Performance timer — tracks phase durations and per-API-call timings.
+        # Timing data is included in exit_json when output_level=debug.
+        self.perf = PerfTimer(self.log)
+        self._wrap_request_for_perf()
+
         self.log.info(f"Initialized NDPolicyModule for fabric: {self.fabric_name}, state: {self.state}")
+
+    def _wrap_request_for_perf(self):
+        """Monkey-patch nd.request to record API call timings."""
+        original_request = self.nd.request
+
+        def timed_request(path, verb, payload=None, **kwargs):
+            start = time.time()
+            try:
+                result = original_request(path, verb, payload, **kwargs)
+                return result
+            finally:
+                duration = time.time() - start
+                status = None
+                try:
+                    status = self.nd.rest_send.response_current.get("RETURN_CODE")
+                except (AttributeError, TypeError):
+                    pass
+                # Compute payload metadata for bulk operations
+                payload_info = None
+                if payload:
+                    if isinstance(payload, dict):
+                        # Track bulk size (e.g., number of policies in bulk create)
+                        for key in ("policies", "policyIds", "switchIds"):
+                            if key in payload and isinstance(payload[key], list):
+                                payload_info = {key: len(payload[key])}
+                                break
+                        if not payload_info:
+                            payload_info = {"keys": list(payload.keys())}
+                self.perf.record_api_call(
+                    verb=str(verb) if not isinstance(verb, str) else verb,
+                    path=path,
+                    duration=duration,
+                    status=status,
+                    payload_info=payload_info,
+                )
+
+        self.nd.request = timed_request
 
     def exit_json(self) -> None:
         """Build final result from all registered tasks and exit.
@@ -243,6 +284,10 @@ class NDPolicyModule:
         output_level = self.module.params.get("output_level", "normal")
         if output_level in ("debug", "info"):
             final["proposed"] = self._proposed
+
+        # Include performance timing breakdown at debug level
+        if output_level == "debug":
+            final["perf_timing"] = self.perf.summary()
 
         if True in self.results.failed:
             self.module.fail_json(
@@ -398,64 +443,56 @@ class NDPolicyModule:
         return result
 
     def resolve_switch_identifiers(self, config):
-        """Resolve switch IP/hostname inputs to serial numbers.
+        """Resolve switch IP inputs to serial numbers via fabric inventory.
 
         The user's arg-spec field is ``serial_number`` with alias ``ip``.
         After ``translate_config()`` the value lives in ``entry["switch"]``
         as a plain string.
 
-        Resolution logic:
-            1. If the value does NOT look like an IP or hostname it is
-               assumed to be a serial number already → pass through.
-            2. If the value looks like an IP or hostname, query the fabric
-               switch inventory and resolve it to a serial number.
-            3. If resolution fails, fail with a clear error.
+        Any value that doesn't look like an IPv4 address is assumed to be
+        a serial number and passed through unchanged.  IPs are resolved by
+        querying ``FabricSwitchInventory`` and looking up
+        ``inventory.by_ip()``.  Resolution failures raise ``NDModuleError``.
 
         Args:
             config: Flat config list from ``translate_config()``.
 
         Returns:
-            The config list with all switch identifiers resolved to serials.
+            The config list with all IP switch identifiers replaced by
+            their corresponding serial numbers.
         """
         if config is None:
             return []
 
-        needs_lookup = set()
-        for entry in config:
-            switch_value = entry.get("switch")
-            if isinstance(switch_value, list):
-                for switch_entry in switch_value:
-                    val = switch_entry.get("serial_number") or switch_entry.get("ip") or ""
-                    if _needs_resolution(val):
-                        needs_lookup.add(val)
-            elif isinstance(switch_value, str) and _needs_resolution(switch_value):
-                needs_lookup.add(switch_value)
+        # Short-circuit: skip the fabric API call if no entry contains an IP.
+        def _iter_ip_values():
+            for entry in config:
+                switch_value = entry.get("switch")
+                if isinstance(switch_value, list):
+                    for sw in switch_value:
+                        val = sw.get("serial_number") or sw.get("ip") or ""
+                        if _looks_like_ip(val):
+                            yield val
+                elif isinstance(switch_value, str) and _looks_like_ip(switch_value):
+                    yield switch_value
 
-        if not needs_lookup:
+        if not any(True for _ in _iter_ip_values()):
             return config
 
-        switches = self._query_fabric_switches()
-
-        ip_map = {}
-        hostname_map = {}
-        for switch in switches:
-            switch_id = switch.get("switchId") or switch.get("serialNumber")
-            if not switch_id:
-                continue
-            fabric_ip = switch.get("fabricManagementIp") or switch.get("ip")
-            if fabric_ip:
-                ip_map[str(fabric_ip).strip()] = switch_id
-            hostname = switch.get("hostname")
-            if hostname:
-                hostname_map[str(hostname).strip().lower()] = switch_id
+        ip_map = self._query_fabric_inventory().by_ip()
 
         def _resolve(identifier):
-            if identifier is None:
-                return None
             value = str(identifier).strip()
-            if not value:
-                return value
-            return ip_map.get(value) or hostname_map.get(value.lower())
+            switch = ip_map.get(value)
+            if switch is None:
+                raise NDModuleError(
+                    msg=(
+                        f"Unable to resolve switch IP '{identifier}' to a serial number "
+                        f"in fabric '{self.fabric_name}'. Provide a valid switch serial_number "
+                        "or management IP from the fabric inventory."
+                    )
+                )
+            return switch.switch_id
 
         for entry in config:
             switch_value = entry.get("switch")
@@ -463,67 +500,45 @@ class NDPolicyModule:
             if isinstance(switch_value, list):
                 for switch_entry in switch_value:
                     original = switch_entry.get("serial_number") or switch_entry.get("ip")
-                    if not _needs_resolution(original):
+                    if not _looks_like_ip(original):
                         continue
                     resolved = _resolve(original)
-                    if resolved is None:
-                        raise NDModuleError(
-                            msg=(
-                                f"Unable to resolve switch identifier '{original}' to a serial number "
-                                f"in fabric '{self.fabric_name}'. Provide a valid switch serial_number, "
-                                "management IP, or hostname from the fabric inventory."
-                            )
-                        )
                     switch_entry["serial_number"] = resolved
                     if "ip" in switch_entry:
                         switch_entry["ip"] = resolved
-            elif isinstance(switch_value, str):
-                if not _needs_resolution(switch_value):
-                    continue
-                resolved = _resolve(switch_value)
-                if resolved is None:
-                    raise NDModuleError(
-                        msg=(
-                            f"Unable to resolve switch identifier '{switch_value}' to a serial number "
-                            f"in fabric '{self.fabric_name}'. Provide a valid switch serial_number, "
-                            "management IP, or hostname from the fabric inventory."
-                        )
-                    )
-                entry["switch"] = resolved
+            elif isinstance(switch_value, str) and _looks_like_ip(switch_value):
+                entry["switch"] = _resolve(switch_value)
 
         return config
 
-    def _query_fabric_switches(self) -> list[dict]:
-        """Query all switches for the fabric and return raw switch records.
+    def _query_fabric_inventory(self) -> FabricSwitchInventory:
+        """Fetch and index the fabric switch inventory via FabricSwitchInventory.
 
         Uses RestSend save_settings/restore_settings to temporarily force
         check_mode=False so that this read-only GET always hits the controller,
-        even when the module is running in Ansible check mode.
+        even when the module is running in Ansible check mode.  The result
+        path/verb is stashed so any synthetic register that follows an empty
+        switch list reflects this lookup.
 
         Returns:
-            List of switch record dicts from the fabric inventory API.
+            ``FabricSwitchInventory`` indexed by IP and switch ID.
         """
-        path = f"{BasePath.path('fabrics', self.fabric_name, 'switches')}?max=10000"
+        self._call_path = BasePath.path("fabrics", self.fabric_name, "switches")
+        self._call_verb = HttpVerbEnum.GET
+        self._call_payload = None
 
         rest_send = self.nd._get_rest_send()
         rest_send.save_settings()
         rest_send.check_mode = False
         try:
-            # Stamp stash so any synthetic register that follows an empty
-            # switch list reflects this GET.  No ep object here, so set
-            # path/verb directly; payload is None for GETs.
-            self._call_path = path
-            self._call_verb = HttpVerbEnum.GET
-            self._call_payload = None
-            response = self.nd.request(path)
+            return FabricSwitchInventory.from_fabric(
+                self.nd,
+                self.fabric_name,
+                self.log,
+                SwitchDataModel,
+            )
         finally:
             rest_send.restore_settings()
-
-        if isinstance(response, list):
-            return response
-        if isinstance(response, dict):
-            return response.get("switches", [])
-        return []
 
     def validate_translated_config(self, translated_config):
         """Validate the translated (flat) config before handing it to manage_state.
@@ -576,10 +591,7 @@ class NDPolicyModule:
         self.log.info("Validating and preparing config")
 
         # Step 1: Pydantic validation + normalization
-        validation_context = {
-            "state": self.state,
-            "use_desc_as_key": self.use_desc_as_key,
-        }
+        validation_context = {"state": self.state, "use_desc_as_key": self.use_desc_as_key}
         normalized_config = []
         for idx, entry in enumerate(self.config):
             try:
@@ -631,20 +643,26 @@ class NDPolicyModule:
         if self.state == "gathered":
             if self.config:
                 # With config: validate & prepare, then gather matching policies
-                self.validate_and_prepare_config()
-            self._handle_gathered_state()
+                with self.perf.phase("validate_and_prepare_config"):
+                    self.validate_and_prepare_config()
+            with self.perf.phase("handle_gathered_state"):
+                self._handle_gathered_state()
             return
 
         # Full config pipeline: pydantic → resolve → translate → validate
-        self.validate_and_prepare_config()
+        with self.perf.phase("validate_and_prepare_config"):
+            self.validate_and_prepare_config()
 
         # Upfront cross-entry validation — hard-fail before any API mutations
-        self._validate_config()
+        with self.perf.phase("validate_config"):
+            self._validate_config()
 
         if self.state == "merged":
-            self._handle_merged_state()
+            with self.perf.phase("handle_merged_state"):
+                self._handle_merged_state()
         elif self.state == "deleted":
-            self._handle_deleted_state()
+            with self.perf.phase("handle_deleted_state"):
+                self._handle_deleted_state()
         else:
             raise NDModuleError(msg=f"Unsupported state: {self.state}")
 
@@ -722,19 +740,42 @@ class NDPolicyModule:
         self.log.info("Handling merged state")
         self.log.debug(f"Config entries: {len(self.config)}")
 
+        # Phase 0: Prefetch all fabric policies in a single GET call.
+        # Subsequent _build_have() calls will use the in-memory cache
+        # instead of making per-entry HTTP GETs.
+        with self.perf.phase("merged_prefetch_policies"):
+            self._prefetch_all_policies(config_entries=self.config)
+
         # Phase 1: Build want and have for each config entry
         diff_results = []
-        for config_entry in self.config:
-            want = self._build_want(config_entry, state="merged")
+        with self.perf.phase("merged_build_want_have_diff"):
+            for config_entry in self.config:
+                want = self._build_want(config_entry, state="merged")
 
-            # Phase 1a: Validate templateInputs against template schema
-            template_name = want.get("templateName")
-            template_inputs = want.get("templateInputs") or {}
-            if template_name and not self._is_policy_id(template_name):
-                validation_errors = self._validate_template_inputs(template_name, template_inputs)
-                if validation_errors:
-                    error_msg = f"Template input validation failed for '{template_name}': " + "; ".join(validation_errors)
-                    self.log.error(error_msg)
+                # Phase 1a: Validate templateInputs against template schema
+                template_name = want.get("templateName")
+                template_inputs = want.get("templateInputs") or {}
+                if template_name and not self._is_policy_id(template_name):
+                    validation_errors = self._validate_template_inputs(template_name, template_inputs)
+                    if validation_errors:
+                        error_msg = f"Template input validation failed for '{template_name}': " + "; ".join(validation_errors)
+                        self.log.error(error_msg)
+                        diff_results.append(
+                            {
+                                "action": "fail",
+                                "want": want,
+                                "have": None,
+                                "diff": None,
+                                "policy_id": None,
+                                "error_msg": error_msg,
+                            }
+                        )
+                        continue
+
+                have_list, error_msg = self._build_have(want)
+
+                if error_msg:
+                    self.log.error(f"Build have failed: {error_msg}")
                     diff_results.append(
                         {
                             "action": "fail",
@@ -747,39 +788,25 @@ class NDPolicyModule:
                     )
                     continue
 
-            have_list, error_msg = self._build_have(want)
-
-            if error_msg:
-                self.log.error(f"Build have failed: {error_msg}")
-                diff_results.append(
-                    {
-                        "action": "fail",
-                        "want": want,
-                        "have": None,
-                        "diff": None,
-                        "policy_id": None,
-                        "error_msg": error_msg,
-                    }
-                )
-                continue
-
-            # Phase 2: Compute diff
-            diff_entry = self._get_diff_merged_single(want, have_list)
-            self.log.debug(f"Diff result for {want.get('templateName', want.get('policyId', 'unknown'))}: " f"action={diff_entry['action']}")
-            diff_results.append(diff_entry)
+                # Phase 2: Compute diff
+                diff_entry = self._get_diff_merged_single(want, have_list)
+                self.log.debug(f"Diff result for {want.get('templateName', want.get('policyId', 'unknown'))}: " f"action={diff_entry['action']}")
+                diff_results.append(diff_entry)
 
         self.log.info(f"Computed {len(diff_results)} diff results")
 
         # Phase 3: Execute actions
-        policy_ids_to_deploy = self._execute_merged(diff_results)
+        with self.perf.phase("merged_execute"):
+            policy_ids_to_deploy = self._execute_merged(diff_results)
 
         # Phase 4: Deploy if requested
         if self.deploy and policy_ids_to_deploy:
-            # Determine if any actual changes occurred (create/update)
-            # vs only no-diff deploys.  No-diff deploys should not mark changed.
-            has_actual_changes = any(dr.get("action") not in ("skip", None) for dr in diff_results)
-            self.log.info(f"Deploying {len(policy_ids_to_deploy)} policies (has_actual_changes={has_actual_changes})")
-            deploy_success = self._deploy_policies(policy_ids_to_deploy, changed=has_actual_changes)
+            with self.perf.phase("merged_deploy"):
+                # Determine if any actual changes occurred (create/update)
+                # vs only no-diff deploys.  No-diff deploys should not mark changed.
+                has_actual_changes = any(dr.get("action") not in ("skip", None) for dr in diff_results)
+                self.log.info(f"Deploying {len(policy_ids_to_deploy)} policies (has_actual_changes={has_actual_changes})")
+                deploy_success = self._deploy_policies(policy_ids_to_deploy, changed=has_actual_changes)
             if not deploy_success:
                 self.log.error(
                     "pushConfig failed for one or more policies after "
@@ -819,39 +846,45 @@ class NDPolicyModule:
         self.log.info("Handling deleted state")
         self.log.debug(f"Config entries: {len(self.config)}")
 
+        # Phase 0: Prefetch all fabric policies in a single GET call.
+        with self.perf.phase("deleted_prefetch_policies"):
+            self._prefetch_all_policies(config_entries=self.config)
+
         # Phase 1: Build want and have for each config entry
         diff_results = []
-        for config_entry in self.config:
-            want = self._build_want(config_entry, state="deleted")
-            have_list, error_msg = self._build_have(want)
+        with self.perf.phase("deleted_build_want_have_diff"):
+            for config_entry in self.config:
+                want = self._build_want(config_entry, state="deleted")
+                have_list, error_msg = self._build_have(want)
 
-            if error_msg:
-                self.log.error(f"Build have failed: {error_msg}")
-                diff_results.append(
-                    {
-                        "action": "fail",
-                        "want": want,
-                        "policies": [],
-                        "policy_ids": [],
-                        "match_count": 0,
-                        "warning": None,
-                        "error_msg": error_msg,
-                    }
-                )
-                continue
+                if error_msg:
+                    self.log.error(f"Build have failed: {error_msg}")
+                    diff_results.append(
+                        {
+                            "action": "fail",
+                            "want": want,
+                            "policies": [],
+                            "policy_ids": [],
+                            "match_count": 0,
+                            "warning": None,
+                            "error_msg": error_msg,
+                        }
+                    )
+                    continue
 
-            # Phase 2: Compute delete result
-            diff_entry = self._get_diff_deleted_single(want, have_list)
-            # Capture the GET stash from _build_have so Phase 3 can stamp
-            # skip/fail rows with the actual lookup path/verb (payload=None).
-            diff_entry["query_path"] = self._call_path
-            diff_entry["query_verb"] = self._call_verb
-            self.log.debug(f"Delete diff for {want.get('templateName', want.get('policyId', 'switch-only'))}: " f"action={diff_entry['action']}")
-            diff_results.append(diff_entry)
+                # Phase 2: Compute delete result
+                diff_entry = self._get_diff_deleted_single(want, have_list)
+                # Capture the GET stash from _build_have so Phase 3 can stamp
+                # skip/fail rows with the actual lookup path/verb (payload=None).
+                diff_entry["query_path"] = self._call_path
+                diff_entry["query_verb"] = self._call_verb
+                self.log.debug(f"Delete diff for {want.get('templateName', want.get('policyId', 'switch-only'))}: " f"action={diff_entry['action']}")
+                diff_results.append(diff_entry)
 
         # Phase 3: Execute delete actions
         self.log.info(f"Computed {len(diff_results)} delete results")
-        self._execute_deleted(diff_results)
+        with self.perf.phase("deleted_execute"):
+            self._execute_deleted(diff_results)
         self.log.debug("EXIT: _handle_deleted_state()")
 
     # =========================================================================
@@ -876,6 +909,12 @@ class NDPolicyModule:
         """
         self.log.debug("ENTER: _handle_gathered_state()")
         self.log.info("Handling gathered state")
+
+        # Phase 0: Prefetch all (or narrowed) fabric policies in one GET.
+        # Subsequent _build_have() / per-switch iteration uses the
+        # in-memory cache instead of N per-entry/per-switch HTTP GETs.
+        with self.perf.phase("gathered_prefetch_policies"):
+            self._prefetch_all_policies(config_entries=self.config if self.config else None)
 
         policies: list[dict] = []
 
@@ -909,7 +948,7 @@ class NDPolicyModule:
             switches = self._get_fabric_switches()
             if not switches:
                 self.log.warning("No switches found in fabric")
-                # Keep the GET stash from _query_fabric_switches so the
+                # Keep the GET stash from _query_fabric_inventory so the
                 # "no switches" row carries the actual lookup path/verb.
                 self._register_result(
                     action="policy_gathered",
@@ -924,18 +963,18 @@ class NDPolicyModule:
                 self.log.debug("EXIT: _handle_gathered_state()")
                 return
 
+            # Use the prefetched cache instead of one GET per switch.
+            # Cache already excludes markDeleted and source!="" entries.
             for switch_sn in switches:
-                self.log.debug(f"Gathering policies for switch {switch_sn}")
-                lucene = self._build_lucene_filter(switchId=switch_sn)
-                switch_policies = self._query_policies(lucene, include_mark_deleted=False)
+                switch_policies = self._policies_by_switch_cache.get(switch_sn, [])
                 self.log.info(f"Found {len(switch_policies)} policies on switch {switch_sn}")
                 policies.extend(switch_policies)
 
         if not policies:
             self.log.info("Gathered: no policies found")
-            # Keep the most recent GET stash (from _build_have or
-            # _query_policies per-switch) so the row reflects a real
-            # lookup that returned empty.
+            # Keep the most recent GET stash (from _build_have or the
+            # prefetch call) so the row reflects a real lookup that
+            # returned empty.
             self._register_result(
                 action="policy_gathered",
                 state="gathered",
@@ -1004,10 +1043,10 @@ class NDPolicyModule:
         self.log.debug("EXIT: _handle_gathered_state()")
 
     def _get_fabric_switches(self) -> list[str]:
-        """Fetch all switch serial numbers in the current fabric.
+        """Return all switch serial numbers in the current fabric.
 
-        Delegates to ``_query_fabric_switches()`` for the API call and
-        extracts serial numbers from the raw switch records.
+        Delegates to :meth:`_query_fabric_inventory` and returns the keys
+        of the indexed ``by_id()`` lookup.
 
         Returns:
             List of serial number strings.
@@ -1015,16 +1054,10 @@ class NDPolicyModule:
         self.log.debug("ENTER: _get_fabric_switches()")
 
         try:
-            records = self._query_fabric_switches()
+            switches = list(self._query_fabric_inventory().by_id().keys())
         except Exception as exc:
             self.log.warning(f"Failed to fetch fabric switches: {exc}")
             return []
-
-        switches = []
-        for sw in records:
-            sn = sw.get("serialNumber") or sw.get("switchId") or sw.get("switchDbID")
-            if sn:
-                switches.append(sn)
 
         self.log.info(f"Found {len(switches)} switches in fabric '{self.fabric_name}'")
         self.log.debug(f"EXIT: _get_fabric_switches() -> {switches}")
@@ -1085,21 +1118,7 @@ class NDPolicyModule:
     # ND system-injected keys present in templateInputs that are
     # NOT real template parameters.  Stripped from gathered output so
     # the result can be fed directly into state=merged.
-    _SYSTEM_INJECTED_KEYS: ClassVar[frozenset] = frozenset(
-        {
-            "FABRIC_NAME",
-            "MARK_DELETED",
-            "POLICY_DESC",
-            "POLICY_GROUP_ID",
-            "POLICY_ID",
-            "PRIORITY",
-            "SECENTITY",
-            "SECENTTYPE",
-            "SERIAL_NUMBER",
-            "SOURCE",
-            "SWITCH_DB_ID",
-        }
-    )
+    _SYSTEM_INJECTED_KEYS: ClassVar[frozenset] = SYSTEM_INJECTED_TEMPLATE_KEYS
 
     def _clean_template_inputs(self, template_name: str, raw_inputs: dict[str, Any]) -> dict[str, Any]:
         """Remove system-injected keys from template inputs.
@@ -1281,10 +1300,7 @@ class NDPolicyModule:
             want_val = str(want_inputs[key]).strip().lower()
             have_val = str(have_inputs.get(key, "")).strip().lower()
             if want_val != have_val:
-                input_diff[key] = {
-                    "want": want_inputs[key],
-                    "have": have_inputs.get(key),
-                }
+                input_diff[key] = {"want": want_inputs[key], "have": have_inputs.get(key)}
         if input_diff:
             diff["templateInputs"] = input_diff
 
@@ -1294,14 +1310,164 @@ class NDPolicyModule:
     # API Query Helpers
     # =========================================================================
 
+    # Max number of (switchId, templateName) OR-clauses to embed in a
+    # single Lucene filter.  Conservative cap to stay well under typical
+    # HTTP URL length limits (8 KB in nginx/Tomcat) and Lucene's default
+    # maxClauseCount (1024).  Beyond this threshold we fall back to an
+    # unfiltered fetch — still a single GET, just with a larger body.
+    _PREFETCH_MAX_NARROW_CLAUSES = 32
+
+    def _prefetch_all_policies(self, config_entries: list[dict] | None = None) -> None:
+        """Fetch fabric policies in a single GET call and build lookup indexes.
+
+        Drastically reduces API call count for bulk operations:
+            - Before: N config entries → N GET calls in _build_have
+            - After:  N config entries → 1 GET call upfront, all lookups in memory
+
+        When ``config_entries`` is provided and every entry resolves to a
+        ``(switchId, templateName)`` pair (i.e. no policy-id-only and no
+        switch-only entries) and the number of unique pairs is at most
+        ``_PREFETCH_MAX_NARROW_CLAUSES``, the GET is narrowed with a
+        Lucene OR-of-ANDs filter to drastically shrink the response body.
+        In all other cases the fetch is unfiltered (1 GET, full list) to
+        guarantee that subsequent in-memory lookups find every policy the
+        caller may ask for — preserving the exact semantics of the
+        per-entry slow path.
+
+        Populates four caches:
+            - self._policies_cache:                    full list of valid policies
+            - self._policies_by_id_cache:              {policyId: policy}
+            - self._policies_by_switch_cache:          {switchId: [policies]}
+            - self._policies_by_switch_template_cache: {(switchId, templateName): [policies]}
+
+        Applies same filtering as the previous per-entry queries
+        (excludes internal sub-policies with source != "" and
+        markDeleted policies).
+        """
+        # Decide whether we can safely narrow the prefetch query.
+        lucene_filter = self._build_prefetch_filter(config_entries)
+        if lucene_filter:
+            self.log.info(f"Prefetching policies with narrowed filter ({lucene_filter[:120]}...)")
+        else:
+            self.log.info("Prefetching all fabric policies (single unfiltered GET)")
+
+        raw = self._query_policies_raw(lucene_filter=lucene_filter)
+
+        self._policies_cache = []
+        excluded = 0
+        for p in raw:
+            if p.get("source", "") != "":
+                excluded += 1
+                continue
+            if p.get("markDeleted", False):
+                excluded += 1
+                continue
+            self._policies_cache.append(p)
+
+        # Build O(1) lookup indexes
+        self._policies_by_id_cache = {}
+        self._policies_by_switch_cache = {}
+        self._policies_by_switch_template_cache = {}
+        for p in self._policies_cache:
+            pid = p.get("policyId")
+            if pid:
+                self._policies_by_id_cache[pid] = p
+            sw = p.get("switchId") or p.get("serialNumber")
+            if sw:
+                self._policies_by_switch_cache.setdefault(sw, []).append(p)
+                tn = p.get("templateName")
+                if tn:
+                    self._policies_by_switch_template_cache.setdefault((sw, tn), []).append(p)
+
+        self.log.info(
+            f"Policy cache populated: {len(self._policies_cache)} active policies "
+            f"({excluded} excluded as internal/markDeleted) across "
+            f"{len(self._policies_by_switch_cache)} switches, "
+            f"{len(self._policies_by_switch_template_cache)} (switch,template) groups"
+        )
+
+    def _build_prefetch_filter(self, config_entries: list[dict] | None) -> str | None:
+        """Build a narrowed Lucene filter for prefetch, or None if not safe.
+
+        Returns a Lucene disjunction over the unique switchIds in the
+        config, e.g.::
+
+            switchId:(S1 OR S2 OR S3)
+
+        when **every** entry has a ``switch`` set and does not reference
+        a policy id by ``name``.  Returns None otherwise — caller must
+        then fetch unfiltered to preserve correctness for policy-id and
+        switch-less entries.
+
+        Why only switchId (no templateName)?
+        ------------------------------------
+        Empirical testing against ND ``GET /fabrics/.../policies`` showed
+        ``templateName`` is effectively unfilterable on the supported
+        controller build:
+
+        * ``templateName:clock_timezone`` (plain) → ``total: 0`` even
+          when matching rows exist.
+        * ``templateName:"clock_timezone"`` (quoted phrase) → 0.
+        * ``templateName:(clock_timezone)`` (group, one value) → 0.
+        * ``templateName:clock`` / ``templateName:timezone`` (tokenized
+          probe) → 0 (so it isn't a hidden tokenizer either).
+        * ``templateName:*clock_timezone*`` (wildcard) → 0.
+        * ``switchId:(S1 OR S2) AND templateName:T`` → returns rows
+          filtered by ``switchId`` only; the ``templateName`` conjunct
+          is silently dropped.
+        * ``switchId:(S1 S2) AND templateName:(T1 T2)`` (space-group on
+          both sides) → 0.
+        * ``(switchId:S AND templateName:T) OR (...)`` (OR-of-ANDs) → 0
+          for multi-clause queries.
+
+        ``NOT source:*`` / ``source:""`` also rejected — ``source`` is
+        not in the controller's filter allowlist (``createTimestamp,
+        createdOn, description, editable, entityName, entityType,
+        generatedConfig, generatedConfigChanges, generatedSearchConfig,
+        hostName, markDeleted, policyId, policyType, priority,
+        ptiOperation, serialNumber, source, switchId, switchIp,
+        switchName, templateContentType, templateName,
+        templateContentType, updateTimestamp, userRole``).  And of the
+        allowlisted fields, ``switchId`` and ``policyId`` are the only
+        ones that consistently match — most others (``templateName``,
+        ``markDeleted``, ``description``, ...) silently return 0 when
+        AND-ed with another conjunct or used in any multi-value form.
+
+        The only filter shape ND honors reliably for our use case is a
+        single-field group disjunction on ``switchId``.  We therefore
+        narrow on switch only and let the downstream cache (indexed by
+        ``(switchId, templateName)``) do exact template filtering
+        client-side.  This over-fetches per switch but is correct and
+        bounded (typically a few hundred policies per switch).
+        """
+        if not config_entries:
+            return None
+
+        switches: set[str] = set()
+        for entry in config_entries:
+            switch = entry.get("switch")
+            name = entry.get("name")
+            # Any entry that can't be expressed via switchId narrowing
+            # disqualifies the narrowed query — we must fetch the full set.
+            if not switch or not name or self._is_policy_id(name):
+                return None
+            switches.add(switch)
+
+        if not switches or len(switches) > self._PREFETCH_MAX_NARROW_CLAUSES:
+            return None
+
+        switch_group = " OR ".join(
+            self._escape_lucene_value(sw) for sw in sorted(switches)
+        )
+        return f"switchId:({switch_group})"
+
     def _query_policies_raw(self, lucene_filter: str | None = None) -> list[dict]:
         """Query policies from the controller using GET /policies (unfiltered).
 
         Returns **all** matching policies including ``markDeleted`` and
-        internal (``source != ""``) entries.  Callers that need the raw
-        list (cleanup routines, gathered-state export) should use this
-        directly.  For idempotency checks use ``_query_policies()``
-        which filters out stale records.
+        internal (``source != ""``) entries.  Callers that need
+        idempotency-safe filtering must post-filter the result (this is
+        what :meth:`_prefetch_all_policies` does).
 
         Args:
             lucene_filter: Optional Lucene filter string.
@@ -1329,111 +1495,6 @@ class NDPolicyModule:
             return policies
         self.log.debug("Query returned non-dict response, returning empty list")
         return []
-
-    def _query_policies(
-        self,
-        lucene_filter: str | None = None,
-        include_mark_deleted: bool = False,
-    ) -> list[dict]:
-        """Query policies with idempotency-safe filtering.
-
-        Wraps ``_query_policies_raw()`` and applies post-filters:
-
-        - **markDeleted** — when ``include_mark_deleted=False`` (default),
-          policies pending deletion are excluded so they don't interfere
-          with idempotency checks.  When ``True``, they are kept and
-          annotated with ``_markDeleted_stale: True`` so callers can
-          surface the status to the user.
-        - **source != ""** — internal ND sub-policies are always
-          excluded; they are artefacts that cause false duplicate
-          matches.
-
-        Args:
-            lucene_filter: Optional Lucene filter string.
-            include_mark_deleted: When True, keep markDeleted policies
-                and annotate them instead of filtering them out.
-
-        Returns:
-            List of policy dicts from the response.
-        """
-        raw = self._query_policies_raw(lucene_filter)
-        if not raw:
-            return []
-
-        result: list[dict] = []
-        excluded = 0
-        for p in raw:
-            # Always exclude internal ND sub-policies (source != "")
-            if p.get("source", "") != "":
-                excluded += 1
-                continue
-
-            if p.get("markDeleted", False):
-                if include_mark_deleted:
-                    # Annotate so callers can display the status
-                    p["_markDeleted_stale"] = True
-                    result.append(p)
-                else:
-                    excluded += 1
-                continue
-
-            result.append(p)
-
-        self.log.debug(f"After filtering: {len(result)} policies " f"(excluded {excluded}, include_mark_deleted={include_mark_deleted})")
-        return result
-
-    def _query_policy_by_id(self, policy_id: str, include_mark_deleted: bool = False) -> dict | None:
-        """Query a single policy by its ID.
-
-        By default, policies marked for deletion (``markDeleted=True``)
-        are treated as non-existent because they are pending removal
-        and cannot be updated.  When ``include_mark_deleted=True``,
-        they are returned with an annotation so the
-        caller can surface the status.
-
-        Args:
-            policy_id: Policy ID (e.g., "POLICY-121110").
-            include_mark_deleted: When True, return markDeleted policies
-                annotated with ``_markDeleted_stale: True``.
-
-        Returns:
-            Policy dict, or None if not found.
-        """
-        self.log.debug(f"Looking up policy by ID: {policy_id}")
-
-        ep = EpManagePoliciesGet()
-        ep.fabric_name = self.fabric_name
-        ep.policy_id = policy_id
-        if self.cluster_name:
-            ep.endpoint_params.cluster_name = self.cluster_name
-
-        try:
-            self._record_call(ep, None)
-            data = self.nd.request(ep.path, ep.verb)
-            if isinstance(data, dict) and data:
-                # The controller may return a 200 with an error body when the
-                # policy is not found, e.g. {'code': 404, 'message': '...not found'}.
-                # Only treat the response as a valid policy if it contains a policyId.
-                if "policyId" not in data:
-                    self.log.info(f"Policy {policy_id} not found (response has no policyId: " f"{data.get('message', data.get('code', 'unknown'))})")
-                    return None
-                if data.get("markDeleted", False):
-                    if include_mark_deleted:
-                        data["_markDeleted_stale"] = True
-                        self.log.info(f"Policy {policy_id} is marked for deletion (included with annotation)")
-                        return data
-                    self.log.info(f"Policy {policy_id} is marked for deletion, treating as not found")
-                    return None
-                self.log.debug(f"Policy {policy_id} found")
-                return data
-            self.log.info(f"Policy {policy_id} not found (empty response)")
-            return None
-        except NDModuleError as error:
-            # 404 means policy not found
-            if error.status == 404:
-                self.log.info(f"Policy {policy_id} not found (404)")
-                return None
-            raise
 
     # =========================================================================
     # Core: Build want / have
@@ -1685,13 +1746,32 @@ class NDPolicyModule:
         return errors
 
     def _build_have(self, want: dict) -> tuple[list[dict], str | None]:
-        """Query the controller to find existing policies matching the want.
+        """Query existing policies matching the want, in-memory against the cache.
 
-        Handles all lookup strategies:
-            - Case A: Policy ID given → direct lookup
-            - Case B: use_desc_as_key=false, templateName given → switchId + templateName
-            - Case C: use_desc_as_key=true, templateName given → switchId + description
-            - Case D: Switch-only (no templateName or policyId) → all policies on switch
+        Dispatches by case to :meth:`_build_have_from_cache`:
+            - Case A: Policy ID given → O(1) policyId index lookup
+            - Case B: use_desc_as_key=false, templateName given → O(1) (switchId, templateName) index
+            - Case C: use_desc_as_key=true,  templateName given → O(1) (switchId, templateName) index + exact description post-filter
+            - Case D: Switch-only (no templateName or policyId) → O(1) switchId index
+
+        :meth:`_prefetch_all_policies` **must** be called by every state
+        handler before this method is invoked.  A missing prefetch is a
+        programming error — we fail loudly here rather than silently
+        falling back to N per-entry HTTP GETs (which is the perf
+        regression the cache was introduced to prevent).
+
+        Note on intentional behavioural differences vs. the legacy
+        per-id ``GET /policies/{policyId}`` endpoint:
+            - Internal ND sub-policies (``source != ""``) are excluded
+              by prefetch.  These are controller artefacts, not
+              user-managed, and were never a supported lookup target.
+            - ``markDeleted`` policies are excluded by prefetch — same
+              as the old slow path with the default ``include_mark_deleted=False``.
+            - Policy-id lookups are bounded by the prefetch's bulk-list
+              page size (``max=10000``).  The same cap applied to the
+              slow path's switch/template queries, so this is not a
+              regression.  Fabrics with >10K policies require
+              pagination in :meth:`_prefetch_all_policies`.
 
         Args:
             want: Want dict produced by ``_build_want``.
@@ -1699,86 +1779,70 @@ class NDPolicyModule:
         Returns:
             Tuple of (have_list, error_msg).
         """
-        self.log.debug("ENTER: _build_have()")
+        if self._policies_cache is None:
+            raise RuntimeError(
+                "_build_have() called before _prefetch_all_policies(); "
+                "every state handler must prefetch the policy cache first."
+            )
+        return self._build_have_from_cache(want)
 
-        # Exclude markDeleted policies to avoid false idempotency matches.
-        incl_md = False
+    def _build_have_from_cache(self, want: dict) -> tuple[list[dict], str | None]:
+        """Cache-backed equivalent of _build_have — pure in-memory filtering.
 
-        # Case A: Policy ID given directly
+        Used when self._policies_cache has been populated by
+        _prefetch_all_policies().  Performs no HTTP calls.
+
+        Args:
+            want: Want dict produced by ``_build_want``.
+
+        Returns:
+            Tuple of (have_list, error_msg).
+        """
+        # Case A: Policy ID given directly — O(1) hash lookup
         if "policyId" in want:
-            self.log.debug(f"Case A: Direct policy ID lookup: {want['policyId']}")
-            policy = self._query_policy_by_id(want["policyId"], include_mark_deleted=incl_md)
+            policy = self._policies_by_id_cache.get(want["policyId"])
             if policy:
-                self.log.info(f"Policy {want['policyId']} found")
+                self.log.debug(f"[cache] Case A: Policy {want['policyId']} found")
                 return [policy], None
-            self.log.info(f"Policy {want['policyId']} not found")
+            self.log.debug(f"[cache] Case A: Policy {want['policyId']} not found")
             return [], None
 
-        # Case D: Switch-only — no name or policyId given
+        # All other cases need switch-scoped list
+        switch_id = want.get("switchId")
+        switch_policies = self._policies_by_switch_cache.get(switch_id, [])
+
+        # Case D: Switch-only — return all policies on switch
         if "templateName" not in want:
-            self.log.debug(f"Case D: Switch-only lookup for {want['switchId']}")
-            lucene = self._build_lucene_filter(switchId=want["switchId"])
-            policies = self._query_policies(lucene, include_mark_deleted=incl_md)
-            self.log.info(f"Found {len(policies)} policies on switch {want['switchId']}")
-            return policies, None
+            self.log.debug(f"[cache] Case D: {len(switch_policies)} policies on switch {switch_id}")
+            return list(switch_policies), None
 
-        # Case B: use_desc_as_key=false, search by switchId + templateName
+        template_name = want["templateName"]
+
+        # Case B: use_desc_as_key=false, filter by templateName.
+        # O(1) composite-index lookup instead of linear scan of switch_policies.
         if not self.use_desc_as_key:
-            self.log.debug(f"Case B: Lookup by switchId={want['switchId']} + " f"templateName={want['templateName']}")
-            lucene = self._build_lucene_filter(
-                switchId=want["switchId"],
-                templateName=want["templateName"],
-            )
-            policies = self._query_policies(lucene, include_mark_deleted=incl_md)
+            matches = list(self._policies_by_switch_template_cache.get((switch_id, template_name), []))
 
-            # If description is provided, use it as an additional post-filter
             want_desc = want.get("description", "")
             if want_desc:
-                pre_filter_count = len(policies)
-                policies = [p for p in policies if (p.get("description", "") or "") == want_desc]
-                self.log.debug(f"Post-filtered by description: {len(policies)} of {pre_filter_count}")
+                pre = len(matches)
+                matches = [p for p in matches if (p.get("description", "") or "") == want_desc]
+                self.log.debug(f"[cache] Case B: post-filter by description: {len(matches)}/{pre}")
 
-            self.log.info(f"Case B matched {len(policies)} policies")
-            return policies, None
+            self.log.debug(f"[cache] Case B: matched {len(matches)} policies")
+            return matches, None
 
-        # Case C: use_desc_as_key=true, search by switchId + description
+        # Case C: use_desc_as_key=true, filter by templateName + exact description.
+        # O(1) composite-index lookup, then exact-match post-filter on description.
         want_desc = want.get("description", "") or ""
-        self.log.debug(f"Case C: Lookup by switchId={want['switchId']} + " f"description='{want_desc}'")
-        # For merged/deleted states, Pydantic enforces that description
-        # is non-empty.  This guard covers gathered state where
-        # Pydantic intentionally skips the check.
         if not want_desc:
-            self.log.warning("Case C: description is required but not provided")
-            return (
-                [],
-                "description is required when use_desc_as_key=true and name is a template name",
-            )
+            return [], "description is required when use_desc_as_key=true and name is a template name"
 
-        # Build Lucene query.  We always include switchId and
-        # templateName (when available) to narrow results.
-        # Description is included only when it contains no Lucene
-        # special characters — ND's Lucene does not reliably handle
-        # escaped special chars (e.g. colons, parentheses) in the
-        # description field.  In all cases, exact-match post-filtering
-        # guarantees correctness.
-        lucene_kwargs: dict[str, str] = {"switchId": want["switchId"]}
-        if "templateName" in want:
-            lucene_kwargs["templateName"] = want["templateName"]
-        # Only add description to Lucene if it's "safe" (no special chars)
-        desc_has_special = any(ch in self._LUCENE_SPECIAL_CHARS for ch in want_desc)
-        if not desc_has_special:
-            lucene_kwargs["description"] = want_desc
-        lucene = self._build_lucene_filter(**lucene_kwargs)
-        policies = self._query_policies(lucene, include_mark_deleted=incl_md)
+        candidates = self._policies_by_switch_template_cache.get((switch_id, template_name), [])
+        matches = [p for p in candidates if (p.get("description", "") or "") == want_desc]
+        self.log.debug(f"[cache] Case C: matched {len(matches)} policies")
+        return matches, None
 
-        # IMPORTANT: Lucene does tokenized matching, not exact match.
-        # Post-filter to ensure exact description match.
-        exact_matches = [p for p in policies if (p.get("description", "") or "") == want_desc]
-        self.log.debug(f"Exact description match: {len(exact_matches)} of {len(policies)}")
-
-        self.log.info(f"Case C matched {len(exact_matches)} policies")
-        self.log.debug("EXIT: _build_have()")
-        return exact_matches, None
 
     # =========================================================================
     # Diff: Merged State (16 cases)
@@ -2051,10 +2115,7 @@ class NDPolicyModule:
                 want = diff_entry["want"]
                 self._proposed.append(want)
                 self._after.append(self._strip_internal(want))
-                self._record_call(
-                    self._wouldbe_create_ep(),
-                    {"policies": [self._strip_internal(want)]},
-                )
+                self._record_call(self._wouldbe_create_ep(), {"policies": [self._strip_internal(want)]})
                 self._register_result(
                     action="policy_create",
                     operation_type=OperationType.CREATE,
@@ -2634,12 +2695,7 @@ class NDPolicyModule:
                     message="Policy not found — already absent",
                     success=True,
                     found=False,
-                    diff={
-                        "action": action,
-                        "want": want,
-                        "before": None,
-                        "after": None,
-                    },
+                    diff={"action": action, "want": want, "before": None, "after": None},
                 )
                 continue
 
@@ -2690,11 +2746,6 @@ class NDPolicyModule:
                         diff=diff_payload,
                     )
                     continue
-
-                # Real mode: do NOT register a per-entry intent row here. The
-                # bulk markDelete in Phase B emits a single authoritative row
-                # (with the deduplicated policyIds and the real path/payload);
-                # an extra per-entry row would just duplicate that information.
                 continue
 
         # Phase B: Execute bulk API calls (skip if check_mode or nothing to delete)
