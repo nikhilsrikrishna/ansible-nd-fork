@@ -27,6 +27,10 @@ in the ND Manage API.
   (POST /api/v1/manage/fabrics/{fabric_name}/interfaceActions/normalize)
 - `EpManageInterfacesRemove` - Bulk delete interfaces
   (POST /api/v1/manage/fabrics/{fabric_name}/interfaceActions/remove)
+- `EpManageInterfacesBreakout` - Break out physical interfaces
+  (POST /api/v1/manage/fabrics/{fabric_name}/interfaceActions/breakout)
+- `EpManageInterfacesSummaryGet` - Filtered interface summaries
+  (GET /api/v1/manage/fabrics/{fabric_name}/interfacesSummary)
 """
 
 from __future__ import annotations
@@ -44,6 +48,7 @@ from ansible_collections.cisco.nd.plugins.module_utils.endpoints.mixins import (
     MaxMixin,
     NetworkNameMixin,
     OffsetMixin,
+    SwitchIdMixin,
     SwitchSerialNumberMixin,
 )
 from ansible_collections.cisco.nd.plugins.module_utils.endpoints.query_params import EndpointQueryParams
@@ -62,6 +67,51 @@ class ManageInterfacesListEndpointParams(ClusterNameMixin, FilterMixin, MaxMixin
 
     sort: str | None = Field(default=None, min_length=1, description="Sort field and direction")
     config_only: bool | None = Field(default=None, description="Return config-only interface data")
+
+
+class ManageInterfacesSummaryEndpointParams(SwitchIdMixin, FilterMixin, MaxMixin, OffsetMixin, EndpointQueryParams):
+    """Query parameters for scoped, paginated interface-summary discovery."""
+
+    include_all: bool | None = Field(default=None, description="Include all interfaces rather than managed interfaces only")
+
+
+class EpManageInterfacesSummaryGet(FabricNameMixin, NDEndpointBaseModel):
+    """GET filtered summaries at ``/fabrics/{fabric_name}/interfacesSummary``."""
+
+    class_name: Literal["EpManageInterfacesSummaryGet"] = Field(default="EpManageInterfacesSummaryGet", frozen=True, description="Class name")
+    endpoint_params: ManageInterfacesSummaryEndpointParams = Field(default_factory=ManageInterfacesSummaryEndpointParams)
+
+    @property
+    def path(self) -> str:
+        """Build the summary URL; require only the fabric path identifier."""
+        if self.fabric_name is None:
+            raise ValueError(f"{type(self).__name__}.path: fabric_name must be set before accessing path.")
+        base_path = BasePath.path("fabrics", quote(self.fabric_name, safe=""), "interfacesSummary")
+        query = self.endpoint_params.to_query_string()
+        return f"{base_path}?{query}" if query else base_path
+
+    @property
+    def verb(self) -> HttpVerbEnum:
+        """Return GET."""
+        return HttpVerbEnum.GET
+
+
+class EpManageInterfacesBreakout(FabricNameMixin, NDEndpointBaseModel):
+    """POST ``interfaces[]`` to ``/fabrics/{fabric_name}/interfaceActions/breakout``."""
+
+    class_name: Literal["EpManageInterfacesBreakout"] = Field(default="EpManageInterfacesBreakout", frozen=True, description="Class name")
+
+    @property
+    def path(self) -> str:
+        """Build the breakout action URL; require the fabric name."""
+        if self.fabric_name is None:
+            raise ValueError(f"{type(self).__name__}.path: fabric_name must be set before accessing path.")
+        return BasePath.path("fabrics", quote(self.fabric_name, safe=""), "interfaceActions", "breakout")
+
+    @property
+    def verb(self) -> HttpVerbEnum:
+        """Return POST."""
+        return HttpVerbEnum.POST
 
 
 class _EpManageInterfacesBase(FabricNameMixin, SwitchSerialNumberMixin, InterfaceNameMixin, NDEndpointBaseModel):
