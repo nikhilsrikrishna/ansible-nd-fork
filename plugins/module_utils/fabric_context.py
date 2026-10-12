@@ -84,8 +84,8 @@ class FabricContext:
         Initialize with `RestSend` and a fabric name; metadata is not fetched until needed.
         The optional observer receives each completed GET path before response-status handling, allowing callers to
         register the current response without copying request history or issuing additional queries.
-        The optional error observer receives the path, original commit exception, and whether any fresh response was
-        received during that GET, even if a later retry prevented commit completion. It is best-effort diagnostics:
+        The optional error observer receives the path, original commit exception, and whether the GET added a
+        completed response to the existing transport history. It is best-effort diagnostics:
         observer errors never replace the original query exception.
 
         ## Raises
@@ -137,7 +137,7 @@ class FabricContext:
         """
         self._rest_send.path = path
         self._rest_send.verb = HttpVerbEnum.GET
-        response_generation = self._rest_send.response_generation
+        response_count = self._rest_send.response_count
         started = time.monotonic()
         try:
             self._rest_send.commit()
@@ -145,7 +145,7 @@ class FabricContext:
             self._last_query_elapsed_seconds = round(time.monotonic() - started, 3)
             if self._query_error_observer is not None:
                 try:
-                    self._query_error_observer(path, error, self._rest_send.response_generation > response_generation)
+                    self._query_error_observer(path, error, self._rest_send.response_count > response_count)
                 except Exception:  # pylint: disable=broad-except
                     # Diagnostics must never mask the primary GET error.
                     pass
