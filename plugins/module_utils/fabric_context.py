@@ -324,9 +324,9 @@ class FabricContext:
         while True:
             ep = EpManageSwitchesListGet()
             ep.fabric_name = self._fabric_name
-            ep.endpoint_params.filter = f"fabricManagementIp:{switch_ip}"
-            ep.endpoint_params.max = page_size
-            ep.endpoint_params.offset = offset
+            ep.lucene_params.filter = f"fabricManagementIp:{switch_ip}"
+            ep.lucene_params.max = page_size
+            ep.lucene_params.offset = offset
             result = self._query_get(ep.path)
             if self._rest_send.return_code == 404:
                 break
